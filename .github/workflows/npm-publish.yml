@@ -30,6 +30,13 @@ jobs:
         run: npm run check
 
       - name: Publish package
-        run: npm publish --access public
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          PUBLISHED=$(npm view "@nevermindzzt/dsh-manager-plugin@$VERSION" version 2>/dev/null || true)
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "@nevermindzzt/dsh-manager-plugin@$VERSION is already published"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
