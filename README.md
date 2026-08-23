@@ -1,6 +1,7 @@
 # @nevermindzzt/dsh-manager-plugin
 
 ![Version](https://img.shields.io/badge/version-v0.1.0-blue)
+[![npm](https://img.shields.io/npm/v/@nevermindzzt/dsh-manager-plugin?logo=npm)](https://www.npmjs.com/package/@nevermindzzt/dsh-manager-plugin)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![Module](https://img.shields.io/badge/dsh%20Client%20Module-Web-5b8cff)
@@ -49,9 +50,14 @@
 
 ## 安装
 
-插件包发布后，可以直接通过 dsh profile 安装：
+插件发布到 npm 后，可以直接通过 dsh profile 安装：
 
     dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin
+
+也可以使用 npm 安装到 dsh profile：
+
+    cd %USERPROFILE%\.dsh\profiles\web
+    npm install @nevermindzzt/dsh-manager-plugin
 
 本地 tarball 安装：
 
@@ -184,6 +190,25 @@ Linux 下插件会尝试使用 0700 目录和 0600 文件权限保存状态。
 - dsh settings namespace；
 - dsh settings plugin card；
 - dsh bundle patch。
+
+## 发布
+
+GitHub Actions 会在推送 vX.Y.Z 标签时自动执行：
+
+1. 安装依赖；
+2. 运行 npm run check；
+3. 构建 Web Client ModuleLoader bundle；
+4. 发布到 npm。
+
+需要在 GitHub 仓库 Secrets 中配置：
+
+    NPM_TOKEN
+
+本地发布前验证：
+
+    npm ci
+    npm run check
+    npm publish --access public
 
 ## 相关项目
 

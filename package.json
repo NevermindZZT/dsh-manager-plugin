@@ -4,6 +4,13 @@
   "description": "Direct dsh-manager reverse tunnel plugin for DeepSeek Harness",
   "type": "module",
   "main": "src/index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs && prettier --write lib/client.js",
+    "format": "prettier --write src/*.js lib/*.js scripts/*.mjs",
+    "check": "npm run build && prettier --check src/*.js lib/*.js scripts/*.mjs && node --check src/index.js && node --check src/protocol.js && node --check src/tunnel.js && node --check src/client.js && node --check lib/client.js",
+    "test": "npm run check",
+    "prepack": "npm run build"
+  },
   "exports": {
     ".": "./src/index.js",
     "./protocol": "./src/protocol.js",
