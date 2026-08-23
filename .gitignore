@@ -1,0 +1,18 @@
+node_modules/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+
+# Local package artifacts and test data
+*.tgz
+test-data/
+.dsh/
+*.tmp
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

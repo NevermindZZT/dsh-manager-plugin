@@ -1,0 +1,52 @@
+{
+  "name": "@nevermindzzt/dsh-manager-plugin",
+  "version": "0.1.0",
+  "description": "Direct dsh-manager reverse tunnel plugin for DeepSeek Harness",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./protocol": "./src/protocol.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "README.md",
+    "LICENSE",
+    "dsh.patch.yml",
+    "dsh.plugin.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.1-rc.2"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

@@ -1,0 +1,350 @@
+import http from "node:http";
+import https from "node:https";
+import WebSocket from "ws";
+import {
+  enrollmentPayload,
+  managerUrls,
+  normalizeCapabilities,
+  DEFAULT_CAPABILITIES,
+} from "./protocol.js";
+function fingerprint(value) {
+  return String(value || "")
+    .replace(/[^a-f0-9]/gi, "")
+    .toUpperCase();
+}
+function tlsAgent(expected) {
+  return new https.Agent({
+    rejectUnauthorized: false,
+    checkServerIdentity(_host, cert) {
+      if (!expected) return undefined;
+      return fingerprint(cert.fingerprint256) === fingerprint(expected)
+        ? undefined
+        : new Error("manager TLS fingerprint mismatch");
+    },
+  });
+}
+function requestJson(url, method, payload, token, expectedFingerprint) {
+  return new Promise((resolve, reject) => {
+    const body = payload === undefined ? "" : JSON.stringify(payload);
+    const secure = url.protocol === "https:";
+    const options = {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (secure ? 443 : 80),
+      path: url.pathname + url.search,
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+    if (token) options.headers.Authorization = "Bearer " + token;
+    if (secure) options.agent = tlsAgent(expectedFingerprint);
+    const req = (secure ? https : http).request(options, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        let value = {};
+        try {
+          value = text ? JSON.parse(text) : {};
+        } catch {
+          value = { error: text };
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300)
+          return reject(
+            new Error(value.error || "manager HTTP " + res.statusCode),
+          );
+        resolve(value);
+      });
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+export class ManagerTunnel {
+  constructor(options) {
+    this.options = options;
+    this.manager = managerUrls(options.serverUrl);
+    console.info(
+      "[dsh-manager-plugin] manager transport:",
+      this.manager.base.href,
+      "agentType=dsh-plugin",
+    );
+    this.capabilities = normalizeCapabilities(
+      options.capabilities || DEFAULT_CAPABILITIES,
+    );
+    this.agentId = options.agentId || "";
+    this.agentToken = options.agentToken || "";
+    this.socket = null;
+    this.closed = false;
+    this.sockets = new Map();
+    this.reconnectDelay = 1000;
+  }
+  async start() {
+    this.closed = false;
+    if (!this.agentId || !this.agentToken) await this.enroll();
+    try {
+      await this.connect();
+    } catch (error) {
+      if (error?.code !== "AGENT_AUTH_REJECTED") throw error;
+      console.warn(
+        "[dsh-manager-plugin] saved Agent credentials were rejected; re-enrolling",
+      );
+      this.agentId = "";
+      this.agentToken = "";
+      await this.enroll();
+      await this.connect();
+    }
+  }
+  async enroll() {
+    const result = await requestJson(
+      this.manager.enroll,
+      "POST",
+      enrollmentPayload(this.options),
+      "",
+      this.options.tlsFingerprint,
+    );
+    this.agentId = result.agentId;
+    this.agentToken = result.agentToken;
+    if (!this.agentId || !this.agentToken)
+      throw new Error("invalid manager enrollment response");
+    this.options.onEnrollment?.({
+      agentId: this.agentId,
+      agentToken: this.agentToken,
+    });
+    this.options.pairingCode = "";
+  }
+  connect() {
+    return new Promise((resolve, reject) => {
+      const wsOptions = {
+        headers: {
+          Authorization: "Bearer " + this.agentToken,
+          "X-Agent-Id": this.agentId,
+        },
+        rejectUnauthorized: false,
+      };
+      if (this.manager.base.protocol === "https:")
+        wsOptions.agent = tlsAgent(this.options.tlsFingerprint);
+      const socket = new WebSocket(this.manager.connect, wsOptions);
+      this.socket = socket;
+      let settled = false;
+      let authRejected = false;
+      socket.once("open", () => {
+        settled = true;
+        this.reconnectDelay = 1000;
+        console.info(
+          "[dsh-manager-plugin] sending register:",
+          this.options.name || "dsh-plugin",
+          this.options.instanceId || "default",
+        );
+        this.send({
+          type: "register",
+          name: this.options.name || "dsh-plugin",
+          agentType: "dsh-plugin",
+          agentVersion: process.version,
+          pluginVersion: this.options.pluginVersion || "0.1.0",
+          capabilities: this.capabilities,
+          instances: [this.instance()],
+        });
+        resolve();
+      });
+      socket.on("message", (data) => this.handleMessage(data));
+      socket.once("unexpected-response", (_request, response) => {
+        const error = new Error(
+          "manager WebSocket rejected: HTTP " + response.statusCode,
+        );
+        if (response.statusCode === 401 || response.statusCode === 403)
+          error.code = "AGENT_AUTH_REJECTED";
+        authRejected = error.code === "AGENT_AUTH_REJECTED";
+        response.resume();
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
+      socket.once("error", (error) => {
+        console.error("[dsh-manager-plugin] WebSocket error:", error.message);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
+      socket.once("close", () => {
+        console.warn("[dsh-manager-plugin] WebSocket closed");
+        this.socket = null;
+        if (!this.closed && !authRejected) this.scheduleReconnect();
+      });
+    });
+  }
+  scheduleReconnect() {
+    const delay = this.reconnectDelay;
+    this.reconnectDelay = Math.min(30000, delay * 2);
+    setTimeout(() => {
+      if (!this.closed) this.connect().catch(() => {});
+    }, delay);
+  }
+  instance() {
+    return {
+      instanceId: this.options.instanceId || "default",
+      displayName: this.options.name || "dsh-plugin",
+      type: "plugin",
+      state: "running",
+      urlAvailable: true,
+      persistenceMode: "host",
+      generation: 1,
+      eventSeq: 1,
+    };
+  }
+  send(value) {
+    if (this.socket?.readyState === WebSocket.OPEN)
+      this.socket.send(JSON.stringify(value));
+  }
+  async handleMessage(raw) {
+    let message;
+    try {
+      message = JSON.parse(raw.toString("utf8"));
+    } catch {
+      return;
+    }
+    if (message.type === "command")
+      return this.send({
+        type: "command_result",
+        requestId: message.requestId,
+        instanceId: message.instanceId,
+        ok: false,
+        error: "dsh-plugin does not support lifecycle commands",
+      });
+    if (message.type === "proxy_request") return this.proxyHttp(message);
+    if (message.type === "proxy_ws_open") return this.openWebSocket(message);
+    if (message.type === "proxy_ws_frame")
+      return this.forwardWebSocketFrame(message);
+    if (message.type === "proxy_ws_close") return this.closeWebSocket(message);
+  }
+  localUrl(path) {
+    return new URL(
+      String(path || "/").replace(/^\//, ""),
+      this.options.localOrigin.endsWith("/")
+        ? this.options.localOrigin
+        : this.options.localOrigin + "/",
+    );
+  }
+  async proxyHttp(message) {
+    try {
+      const target = this.localUrl(message.path);
+      const headers = { ...(message.headers || {}) };
+      delete headers.host;
+      delete headers.connection;
+      delete headers.upgrade;
+      const localOrigin = this.options.localOrigin.replace(/\/$/, "");
+      for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase();
+        if (lower === "origin") headers[key] = localOrigin;
+        else if (lower === "referer") headers[key] = localOrigin + "/";
+      }
+      const body = message.body
+        ? Buffer.from(message.body, "base64")
+        : undefined;
+      const response = await fetch(target, {
+        method: message.method || "GET",
+        headers,
+        body,
+        redirect: "manual",
+      });
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const resultHeaders = {};
+      response.headers.forEach((value, key) => {
+        if (
+          !["connection", "transfer-encoding", "content-length"].includes(
+            key.toLowerCase(),
+          )
+        )
+          resultHeaders[key] = value;
+      });
+      this.send({
+        type: "proxy_response",
+        requestId: message.requestId,
+        status: response.status,
+        headers: resultHeaders,
+        body: bytes.toString("base64"),
+      });
+    } catch (error) {
+      this.send({
+        type: "proxy_response",
+        requestId: message.requestId,
+        status: 502,
+        error: error.message,
+      });
+    }
+  }
+  openWebSocket(message) {
+    try {
+      const target = this.localUrl(message.path);
+      target.protocol = "ws:";
+      const socket = new WebSocket(target);
+      this.sockets.set(message.requestId, socket);
+      socket.on("open", () =>
+        this.send({
+          type: "proxy_ws_open_result",
+          requestId: message.requestId,
+          ok: true,
+        }),
+      );
+      socket.on("message", (data, isBinary) =>
+        this.send({
+          type: "proxy_ws_frame",
+          requestId: message.requestId,
+          frameType: isBinary ? "binary" : "text",
+          body: Buffer.from(data).toString("base64"),
+        }),
+      );
+      socket.on("error", (error) =>
+        this.send({
+          type: "proxy_ws_close",
+          requestId: message.requestId,
+          error: error.message,
+        }),
+      );
+      socket.on("close", () => {
+        this.sockets.delete(message.requestId);
+        this.send({
+          type: "proxy_ws_close",
+          requestId: message.requestId,
+          error: "local dsh websocket closed",
+        });
+      });
+    } catch (error) {
+      this.send({
+        type: "proxy_ws_open_result",
+        requestId: message.requestId,
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+  forwardWebSocketFrame(message) {
+    const socket = this.sockets.get(message.requestId);
+    if (socket)
+      socket.send(Buffer.from(message.body || "", "base64"), {
+        binary: message.frameType === "binary",
+      });
+  }
+  closeWebSocket(message) {
+    const socket = this.sockets.get(message.requestId);
+    if (socket) {
+      socket.close();
+      this.sockets.delete(message.requestId);
+    }
+  }
+  close() {
+    this.closed = true;
+    for (const socket of this.sockets.values()) socket.close();
+    this.sockets.clear();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.removeAllListeners();
+      socket.terminate();
+    }
+  }
+}
