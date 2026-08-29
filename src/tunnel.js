@@ -93,6 +93,7 @@ export class ManagerTunnel {
     this.connecting = true;
     try {
       if (!this.agentId || !this.agentToken) await this.enroll();
+      if (this.closed) return;
       try {
         await this.connect();
       } catch (error) {
@@ -103,6 +104,7 @@ export class ManagerTunnel {
         this.agentId = "";
         this.agentToken = "";
         await this.enroll();
+        if (this.closed) return;
         await this.connect();
       }
     } finally {
@@ -160,7 +162,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.2",
+          pluginVersion: this.options.pluginVersion || "0.1.3",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });
@@ -261,6 +263,11 @@ export class ManagerTunnel {
     try {
       const target = this.localUrl(message.path);
       const headers = { ...(message.headers || {}) };
+      console.info(
+        "[dsh-manager-plugin] proxy request:",
+        message.method || "GET",
+        message.path,
+      );
       delete headers.host;
       delete headers.connection;
       delete headers.upgrade;
@@ -300,6 +307,14 @@ export class ManagerTunnel {
         )
           resultHeaders[key] = value;
       });
+      console.info(
+        "[dsh-manager-plugin] proxy response:",
+        message.method || "GET",
+        message.path,
+        response.status,
+        bytes.length + " bytes",
+        setCookies.length + " cookies",
+      );
       this.send({
         type: "proxy_response",
         requestId: message.requestId,
@@ -309,6 +324,12 @@ export class ManagerTunnel {
         body: bytes.toString("base64"),
       });
     } catch (error) {
+      console.error(
+        "[dsh-manager-plugin] proxy request failed:",
+        message.method || "GET",
+        message.path,
+        error.message,
+      );
       this.send({
         type: "proxy_response",
         requestId: message.requestId,
@@ -392,8 +413,15 @@ export class ManagerTunnel {
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.keepaliveTimer = null;
     if (socket) {
-      socket.removeAllListeners();
-      socket.terminate();
+      if (socket.readyState === WebSocket.CONNECTING) {
+        // ws.terminate() can emit a late error for a CONNECTING socket.
+        // Keep a sink listener because this close is intentional and must
+        // never crash the host process during settings updates.
+        socket.on("error", () => {});
+        socket.terminate();
+      } else if (socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
     }
   }
 }

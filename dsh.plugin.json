@@ -1,6 +1,6 @@
 {
   "id": "dsh-manager-plugin",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "main": "src/index.js",
   "description": "Direct dsh-manager tunnel and settings for dsh"
 }

@@ -1,6 +1,6 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.1.2-blue)
+![Version](https://img.shields.io/badge/version-v0.1.3-blue)
 [![npm](https://img.shields.io/npm/v/@nevermindzzt/dsh-manager-plugin?logo=npm)](https://www.npmjs.com/package/@nevermindzzt/dsh-manager-plugin)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
@@ -13,7 +13,7 @@
 
 当前版本：
 
-    0.1.2
+    0.1.3
 
 协议保持：
 
@@ -61,7 +61,7 @@
 
 本地 tarball 安装：
 
-    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.2.tgz
+    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.3.tgz
 
 安装后重启 dsh：
 
