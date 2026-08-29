@@ -120,7 +120,7 @@ export default {
         tlsFingerprint: settings.tlsFingerprint,
         name: settings.name,
         instanceId: settings.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.1",
+        pluginVersion: config.pluginVersion || "0.1.2",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
           writeState(file, {

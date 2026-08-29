@@ -1,6 +1,6 @@
 {
   "name": "@nevermindzzt/dsh-manager-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Direct dsh-manager reverse tunnel plugin for DeepSeek Harness",
   "type": "module",
   "main": "src/index.js",

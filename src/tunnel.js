@@ -160,7 +160,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.1",
+          pluginVersion: this.options.pluginVersion || "0.1.2",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });
@@ -287,6 +287,7 @@ export class ManagerTunnel {
       });
       const bytes = Buffer.from(await response.arrayBuffer());
       const resultHeaders = {};
+      const setCookies = response.headers.getSetCookie?.() || [];
       response.headers.forEach((value, key) => {
         if (
           ![
@@ -294,6 +295,7 @@ export class ManagerTunnel {
             "transfer-encoding",
             "content-length",
             "content-encoding",
+            "set-cookie",
           ].includes(key.toLowerCase())
         )
           resultHeaders[key] = value;
@@ -303,6 +305,7 @@ export class ManagerTunnel {
         requestId: message.requestId,
         status: response.status,
         headers: resultHeaders,
+        setCookies,
         body: bytes.toString("base64"),
       });
     } catch (error) {
