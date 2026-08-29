@@ -69,13 +69,15 @@ export default {
         config.tlsFingerprint || process.env.DSH_MANAGER_TLS_FINGERPRINT || "",
     };
     let source = () => entry;
+    let sourceReady = false;
     let tunnel = null;
     let disposed = false;
     let syncScheduled = false;
+    let syncTimer = null;
     let lastSettingsKey = "";
 
     const syncTunnel = () => {
-      if (disposed) return;
+      if (disposed || !sourceReady) return;
       const settings = source();
       const settingsKey = JSON.stringify({
         enabled: settings.enabled,
@@ -118,7 +120,7 @@ export default {
         tlsFingerprint: settings.tlsFingerprint,
         name: settings.name,
         instanceId: settings.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.0",
+        pluginVersion: config.pluginVersion || "0.1.1",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
           writeState(file, {
@@ -138,10 +140,13 @@ export default {
     const scheduleSync = () => {
       if (syncScheduled) return;
       syncScheduled = true;
-      queueMicrotask(() => {
+      // Never perform enrollment or socket setup during plugin apply. Let dsh
+      // finish booting first; the tunnel is an optional background service.
+      const timer = setTimeout(() => {
         syncScheduled = false;
-        syncTunnel();
-      });
+        if (!disposed) syncTunnel();
+      }, 0);
+      timer.unref?.();
     };
 
     installSettingsSection(
@@ -152,11 +157,19 @@ export default {
       {
         setSource: (current) => {
           source = current;
+          sourceReady = true;
+          scheduleSync();
         },
         onChange: scheduleSync,
       },
     );
-    syncTunnel();
+    const readinessTimer = setTimeout(() => {
+      if (!sourceReady) {
+        sourceReady = true;
+        scheduleSync();
+      }
+    }, 100);
+    readinessTimer.unref?.();
     return () => {
       disposed = true;
       tunnel?.close();

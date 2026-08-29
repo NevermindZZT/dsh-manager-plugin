@@ -58,6 +58,9 @@ function requestJson(url, method, payload, token, expectedFingerprint) {
         resolve(value);
       });
     });
+    req.setTimeout(10000, () => {
+      req.destroy(new Error("manager request timed out"));
+    });
     req.on("error", reject);
     req.end(body);
   });
@@ -80,21 +83,30 @@ export class ManagerTunnel {
     this.closed = false;
     this.sockets = new Map();
     this.reconnectDelay = 1000;
+    this.reconnectTimer = null;
+    this.keepaliveTimer = null;
+    this.connecting = false;
   }
   async start() {
+    if (this.connecting || this.closed) return;
     this.closed = false;
-    if (!this.agentId || !this.agentToken) await this.enroll();
+    this.connecting = true;
     try {
-      await this.connect();
-    } catch (error) {
-      if (error?.code !== "AGENT_AUTH_REJECTED") throw error;
-      console.warn(
-        "[dsh-manager-plugin] saved Agent credentials were rejected; re-enrolling",
-      );
-      this.agentId = "";
-      this.agentToken = "";
-      await this.enroll();
-      await this.connect();
+      if (!this.agentId || !this.agentToken) await this.enroll();
+      try {
+        await this.connect();
+      } catch (error) {
+        if (error?.code !== "AGENT_AUTH_REJECTED") throw error;
+        console.warn(
+          "[dsh-manager-plugin] saved Agent credentials were rejected; re-enrolling",
+        );
+        this.agentId = "";
+        this.agentToken = "";
+        await this.enroll();
+        await this.connect();
+      }
+    } finally {
+      this.connecting = false;
     }
   }
   async enroll() {
@@ -113,7 +125,8 @@ export class ManagerTunnel {
       agentId: this.agentId,
       agentToken: this.agentToken,
     });
-    this.options.pairingCode = "";
+    // Keep the configured pairing code so a later re-enrollment can recover
+    // after the manager database is replaced or the Agent is revoked.
   }
   connect() {
     return new Promise((resolve, reject) => {
@@ -133,6 +146,10 @@ export class ManagerTunnel {
       socket.once("open", () => {
         settled = true;
         this.reconnectDelay = 1000;
+        this.keepaliveTimer = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) socket.ping();
+        }, 20000);
+        this.keepaliveTimer.unref?.();
         console.info(
           "[dsh-manager-plugin] sending register:",
           this.options.name || "dsh-plugin",
@@ -143,7 +160,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.0",
+          pluginVersion: this.options.pluginVersion || "0.1.1",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });
@@ -172,6 +189,8 @@ export class ManagerTunnel {
       });
       socket.once("close", () => {
         console.warn("[dsh-manager-plugin] WebSocket closed");
+        if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+        this.keepaliveTimer = null;
         this.socket = null;
         if (!this.closed && !authRejected) this.scheduleReconnect();
       });
@@ -180,9 +199,18 @@ export class ManagerTunnel {
   scheduleReconnect() {
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(30000, delay * 2);
-    setTimeout(() => {
-      if (!this.closed) this.connect().catch(() => {});
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.closed)
+        this.start().catch((error) =>
+          console.error(
+            "[dsh-manager-plugin] reconnect failed:",
+            error.message,
+          ),
+        );
     }, delay);
+    this.reconnectTimer.unref?.();
   }
   instance() {
     return {
@@ -236,6 +264,12 @@ export class ManagerTunnel {
       delete headers.host;
       delete headers.connection;
       delete headers.upgrade;
+      // Node fetch transparently decompresses responses. Ask dsh for plain
+      // bytes so the browser never receives a stale Content-Encoding header.
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === "accept-encoding") delete headers[key];
+      }
+      headers["accept-encoding"] = "identity";
       const localOrigin = this.options.localOrigin.replace(/\/$/, "");
       for (const key of Object.keys(headers)) {
         const lower = key.toLowerCase();
@@ -255,9 +289,12 @@ export class ManagerTunnel {
       const resultHeaders = {};
       response.headers.forEach((value, key) => {
         if (
-          !["connection", "transfer-encoding", "content-length"].includes(
-            key.toLowerCase(),
-          )
+          ![
+            "connection",
+            "transfer-encoding",
+            "content-length",
+            "content-encoding",
+          ].includes(key.toLowerCase())
         )
           resultHeaders[key] = value;
       });
@@ -281,7 +318,12 @@ export class ManagerTunnel {
     try {
       const target = this.localUrl(message.path);
       target.protocol = "ws:";
-      const socket = new WebSocket(target);
+      const socket = new WebSocket(target, {
+        headers: {
+          Origin: this.options.localOrigin,
+          Referer: this.options.localOrigin + "/",
+        },
+      });
       this.sockets.set(message.requestId, socket);
       socket.on("open", () =>
         this.send({
@@ -342,6 +384,10 @@ export class ManagerTunnel {
     this.sockets.clear();
     const socket = this.socket;
     this.socket = null;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = null;
     if (socket) {
       socket.removeAllListeners();
       socket.terminate();
