@@ -92,20 +92,26 @@ export class ManagerTunnel {
     this.closed = false;
     this.connecting = true;
     try {
-      if (!this.agentId || !this.agentToken) await this.enroll();
+      if (!this.agentId || !this.agentToken) {
+        if (this.options.allowEnrollment === false) {
+          throw new Error(
+            "manager Agent credentials are missing; enter a new pairing code to re-enroll",
+          );
+        }
+        await this.enroll();
+      }
       if (this.closed) return;
       try {
         await this.connect();
       } catch (error) {
         if (error?.code !== "AGENT_AUTH_REJECTED") throw error;
         console.warn(
-          "[dsh-manager-plugin] saved Agent credentials were rejected; re-enrolling",
+          "[dsh-manager-plugin] saved Agent credentials were rejected; enter a new pairing code to re-enroll",
         );
         this.agentId = "";
         this.agentToken = "";
-        await this.enroll();
-        if (this.closed) return;
-        await this.connect();
+        this.options.onCredentialsRejected?.();
+        throw error;
       }
     } finally {
       this.connecting = false;
@@ -162,7 +168,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.3",
+          pluginVersion: this.options.pluginVersion || "0.1.4",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });

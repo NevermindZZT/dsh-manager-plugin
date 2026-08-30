@@ -48,7 +48,7 @@ export default {
   inject: ["webServer"],
   apply(ctx, config = {}) {
     const file = statePath(config);
-    const saved = readState(file);
+    let saved = readState(file);
     const entry = {
       enabled: config.enabled !== false,
       serverUrl:
@@ -57,7 +57,10 @@ export default {
         saved.serverUrl ||
         "",
       pairingCode:
-        config.pairingCode || process.env.DSH_MANAGER_PAIRING_CODE || "",
+        config.pairingCode ||
+        process.env.DSH_MANAGER_PAIRING_CODE ||
+        saved.pairingCode ||
+        "",
       name:
         config.name ||
         process.env.DSH_MANAGER_NAME ||
@@ -89,13 +92,21 @@ export default {
       });
       if (settingsKey === lastSettingsKey) return;
       lastSettingsKey = settingsKey;
-      writeState(file, {
+      const pairingChanged =
+        String(saved.pairingCode || "") !== String(settings.pairingCode || "");
+      saved = {
         ...saved,
         serverUrl: settings.serverUrl,
+        pairingCode: settings.pairingCode,
         name: settings.name,
         instanceId: settings.instanceId,
         tlsFingerprint: settings.tlsFingerprint,
-      });
+      };
+      if (pairingChanged) {
+        delete saved.agentId;
+        delete saved.agentToken;
+      }
+      writeState(file, saved);
       if (tunnel) {
         tunnel.close();
         tunnel = null;
@@ -111,24 +122,38 @@ export default {
         ...config,
         serverUrl: settings.serverUrl,
         pairingCode: settings.pairingCode,
-        agentId:
-          config.agentId || process.env.DSH_MANAGER_AGENT_ID || saved.agentId,
-        agentToken:
-          config.agentToken ||
-          process.env.DSH_MANAGER_AGENT_TOKEN ||
-          saved.agentToken,
+        // A newly entered pairing code is an explicit request to enroll a new
+        // Agent. Never reuse credentials that belong to the previous code.
+        agentId: pairingChanged
+          ? ""
+          : config.agentId || process.env.DSH_MANAGER_AGENT_ID || saved.agentId,
+        agentToken: pairingChanged
+          ? ""
+          : config.agentToken ||
+            process.env.DSH_MANAGER_AGENT_TOKEN ||
+            saved.agentToken,
+        // Enrollment is allowed only after the user changes the pairing code.
+        // A revoked Agent must not immediately create a replacement record.
+        allowEnrollment: pairingChanged,
+        onCredentialsRejected: () => {
+          delete saved.agentId;
+          delete saved.agentToken;
+          writeState(file, saved);
+        },
         tlsFingerprint: settings.tlsFingerprint,
         name: settings.name,
         instanceId: settings.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.3",
+        pluginVersion: config.pluginVersion || "0.1.4",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
-          writeState(file, {
+          saved = {
             ...saved,
             ...result,
             serverUrl: settings.serverUrl,
+            pairingCode: settings.pairingCode,
             name: settings.name,
-          });
+          };
+          writeState(file, saved);
           config.onEnrollment?.(result);
         },
       });
