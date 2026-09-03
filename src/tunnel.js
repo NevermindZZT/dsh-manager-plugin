@@ -12,6 +12,11 @@ function fingerprint(value) {
     .replace(/[^a-f0-9]/gi, "")
     .toUpperCase();
 }
+function tunnelClosedError() {
+  const error = new Error("manager tunnel closed");
+  error.code = "MANAGER_TUNNEL_CLOSED";
+  return error;
+}
 function tlsAgent(expected) {
   return new https.Agent({
     rejectUnauthorized: false,
@@ -85,6 +90,7 @@ export class ManagerTunnel {
     this.reconnectDelay = 1000;
     this.reconnectTimer = null;
     this.keepaliveTimer = null;
+    this.pendingConnectReject = null;
     this.connecting = false;
   }
   async start() {
@@ -98,6 +104,11 @@ export class ManagerTunnel {
             "manager Agent credentials are missing; enter a new pairing code to re-enroll",
           );
         }
+        if (!String(this.options.pairingCode || "").trim()) {
+          throw new Error(
+            "manager Agent credentials are missing; configure a pairing code to enroll",
+          );
+        }
         await this.enroll();
       }
       if (this.closed) return;
@@ -105,13 +116,25 @@ export class ManagerTunnel {
         await this.connect();
       } catch (error) {
         if (error?.code !== "AGENT_AUTH_REJECTED") throw error;
-        console.warn(
-          "[dsh-manager-plugin] saved Agent credentials were rejected; enter a new pairing code to re-enroll",
-        );
         this.agentId = "";
         this.agentToken = "";
         this.options.onCredentialsRejected?.();
-        throw error;
+        if (this.closed) return;
+        if (
+          this.options.allowEnrollment === true &&
+          String(this.options.pairingCode || "").trim()
+        ) {
+          console.info(
+            "[dsh-manager-plugin] saved Agent credentials were rejected; enrolling with the newly entered pairing code",
+          );
+          await this.enroll();
+          if (this.closed) return;
+          await this.connect();
+          return;
+        }
+        console.warn(
+          "[dsh-manager-plugin] saved Agent credentials were rejected; waiting for a new pairing code",
+        );
       }
     } finally {
       this.connecting = false;
@@ -150,14 +173,36 @@ export class ManagerTunnel {
       const socket = new WebSocket(this.manager.connect, wsOptions);
       this.socket = socket;
       let settled = false;
+      let opened = false;
       let authRejected = false;
-      socket.once("open", () => {
+      let keepaliveTimer = null;
+      const settleReject = (error) => {
+        if (settled) return;
         settled = true;
+        if (this.pendingConnectReject === settleReject)
+          this.pendingConnectReject = null;
+        reject(error);
+      };
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        if (this.pendingConnectReject === settleReject)
+          this.pendingConnectReject = null;
+        resolve();
+      };
+      this.pendingConnectReject = settleReject;
+      socket.once("open", () => {
+        if (this.closed) {
+          settleReject(tunnelClosedError());
+          return;
+        }
+        opened = true;
         this.reconnectDelay = 1000;
-        this.keepaliveTimer = setInterval(() => {
+        keepaliveTimer = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.ping();
         }, 20000);
-        this.keepaliveTimer.unref?.();
+        keepaliveTimer.unref?.();
+        this.keepaliveTimer = keepaliveTimer;
         console.info(
           "[dsh-manager-plugin] sending register:",
           this.options.name || "dsh-plugin",
@@ -168,11 +213,11 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.4",
+          pluginVersion: this.options.pluginVersion || "0.1.5",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });
-        resolve();
+        settleResolve();
       });
       socket.on("message", (data) => this.handleMessage(data));
       socket.once("unexpected-response", (_request, response) => {
@@ -183,24 +228,43 @@ export class ManagerTunnel {
           error.code = "AGENT_AUTH_REJECTED";
         authRejected = error.code === "AGENT_AUTH_REJECTED";
         response.resume();
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        if (this.closed) settleReject(tunnelClosedError());
+        else settleReject(error);
       });
       socket.once("error", (error) => {
-        console.error("[dsh-manager-plugin] WebSocket error:", error.message);
-        if (!settled) {
-          settled = true;
-          reject(error);
+        if (this.closed) {
+          settleReject(tunnelClosedError());
+          return;
         }
+        // ws can emit a second error after unexpected-response. It is already
+        // represented by that HTTP status and must not become startup noise.
+        if (!opened && settled) return;
+        console.error("[dsh-manager-plugin] WebSocket error:", error.message);
+        settleReject(error);
       });
       socket.once("close", () => {
-        console.warn("[dsh-manager-plugin] WebSocket closed");
-        if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
-        this.keepaliveTimer = null;
-        this.socket = null;
-        if (!this.closed && !authRejected) this.scheduleReconnect();
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        if (this.socket === socket) {
+          this.socket = null;
+          if (this.keepaliveTimer === keepaliveTimer)
+            this.keepaliveTimer = null;
+        }
+        if (this.closed) {
+          settleReject(tunnelClosedError());
+          return;
+        }
+        if (!settled)
+          settleReject(
+            Object.assign(
+              new Error(
+                "manager WebSocket closed before connection established",
+              ),
+              { code: "MANAGER_CONNECT_CLOSED" },
+            ),
+          );
+        if (authRejected) return;
+        if (opened) console.warn("[dsh-manager-plugin] WebSocket closed");
+        this.scheduleReconnect();
       });
     });
   }
@@ -412,6 +476,9 @@ export class ManagerTunnel {
     this.closed = true;
     for (const socket of this.sockets.values()) socket.close();
     this.sockets.clear();
+    const rejectConnect = this.pendingConnectReject;
+    this.pendingConnectReject = null;
+    rejectConnect?.(tunnelClosedError());
     const socket = this.socket;
     this.socket = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -420,9 +487,8 @@ export class ManagerTunnel {
     this.keepaliveTimer = null;
     if (socket) {
       if (socket.readyState === WebSocket.CONNECTING) {
-        // ws.terminate() can emit a late error for a CONNECTING socket.
-        // Keep a sink listener because this close is intentional and must
-        // never crash the host process during settings updates.
+        // ws.terminate() can emit a late error for a CONNECTING socket. The
+        // pending promise is already settled with an intentional-close code.
         socket.on("error", () => {});
         socket.terminate();
       } else if (socket.readyState === WebSocket.OPEN) {

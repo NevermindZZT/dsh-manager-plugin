@@ -22,7 +22,7 @@ function validateServerUrl(value) {
 
 const FIELDS = [
   ["serverUrl", "Manager URL"],
-  ["pairingCode", "配对码"],
+  ["pairingCode", "首次配对码（仅注册时使用）"],
   ["name", "Agent 名称"],
   ["instanceId", "实例 ID"],
   ["tlsFingerprint", "TLS 指纹"],

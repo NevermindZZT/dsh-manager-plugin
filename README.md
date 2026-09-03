@@ -1,6 +1,6 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.1.4-blue)
+![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 [![npm](https://img.shields.io/npm/v/@nevermindzzt/dsh-manager-plugin?logo=npm)](https://www.npmjs.com/package/@nevermindzzt/dsh-manager-plugin)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
@@ -13,7 +13,7 @@
 
 当前版本：
 
-    0.1.4
+    0.1.5
 
 协议保持：
 
@@ -35,7 +35,7 @@
 
 ## 能力
 
-- 一次性配对码注册；
+- 使用首次配对码完成一次性注册；后续连接只使用 Agent Token；
 - HTTP / HTTPS enrollment；
 - WS / WSS Agent 长连接；
 - HTTP 请求反向代理；
@@ -45,7 +45,7 @@
 - Agent Token 本地持久化；
 - 旧版 dsh-manager Agent Protocol v1 兼容；
 - HTTP / HTTPS 端口配置校验；
-- 旧 Agent Token 收到 401/403 后清除本地凭证，输入新配对码后重新配对；
+- 旧 Agent Token 收到 401/403 后清除本地凭证，输入新的配对码后重新注册；
 - 不支持任意 shell 和远程生命周期命令。
 
 ## 安装
@@ -61,7 +61,7 @@
 
 本地 tarball 安装：
 
-    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.4.tgz
+    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.5.tgz
 
 安装后重启 dsh：
 
@@ -79,7 +79,7 @@
 
 - 启用 dsh-manager 直连；
 - Manager URL；
-- 一次性配对码；
+- 首次配对码（仅注册时使用）；
 - Agent 名称；
 - 实例 ID；
 - TLS 指纹。
@@ -101,7 +101,7 @@ HTTPS / WSS（推荐）：
     错误：http://manager.example.com:8443
     正确：https://manager.example.com:8443
 
-HTTPS 模式需要填写 manager 当前证书的 SHA-256 指纹。指纹错误、Agent Token 失效或 manager 更换数据库后，插件会清理旧凭证并等待用户输入新的配对码后重新注册。
+HTTPS 模式需要填写 manager 当前证书的 SHA-256 指纹。配对码只在首次注册或明确重新注册时使用；manager 刷新配对码、重启生成新配对码，都不会影响已有 Agent Token 的连接。只有 Agent Token 失效或 manager 更换数据库后，插件才会清理旧凭证并等待用户输入新的配对码。
 
 ## 环境变量
 

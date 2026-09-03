@@ -78,6 +78,7 @@ export default {
     let syncScheduled = false;
     let syncTimer = null;
     let lastSettingsKey = "";
+    let syncGeneration = 0;
 
     const syncTunnel = () => {
       if (disposed || !sourceReady) return;
@@ -92,72 +93,98 @@ export default {
       });
       if (settingsKey === lastSettingsKey) return;
       lastSettingsKey = settingsKey;
+      const generation = ++syncGeneration;
+      const settingsSnapshot = { ...settings };
       const pairingChanged =
-        String(saved.pairingCode || "") !== String(settings.pairingCode || "");
+        String(saved.pairingCode || "") !==
+        String(settingsSnapshot.pairingCode || "");
       saved = {
         ...saved,
-        serverUrl: settings.serverUrl,
-        pairingCode: settings.pairingCode,
-        name: settings.name,
-        instanceId: settings.instanceId,
-        tlsFingerprint: settings.tlsFingerprint,
+        serverUrl: settingsSnapshot.serverUrl,
+        pairingCode: settingsSnapshot.pairingCode,
+        name: settingsSnapshot.name,
+        instanceId: settingsSnapshot.instanceId,
+        tlsFingerprint: settingsSnapshot.tlsFingerprint,
       };
-      if (pairingChanged) {
-        delete saved.agentId;
-        delete saved.agentToken;
-      }
+      // Pairing codes are enrollment secrets, not connection credentials. A
+      // changed code must never discard a valid Agent token; it is only made
+      // available for an enrollment when the current credentials are absent.
       writeState(file, saved);
-      if (tunnel) {
-        tunnel.close();
-        tunnel = null;
-      }
 
-      if (!settings.enabled || !settings.serverUrl) {
+      const previousTunnel = tunnel;
+      if (!settingsSnapshot.enabled || !settingsSnapshot.serverUrl) {
+        tunnel = null;
+        previousTunnel?.close();
         console.warn(
           "[dsh-manager-plugin] disabled: configure dsh-manager in Settings or set DSH_MANAGER_URL",
         );
         return;
       }
-      tunnel = new ManagerTunnel({
+
+      let localTunnel;
+      localTunnel = new ManagerTunnel({
         ...config,
-        serverUrl: settings.serverUrl,
-        pairingCode: settings.pairingCode,
-        // A newly entered pairing code is an explicit request to enroll a new
-        // Agent. Never reuse credentials that belong to the previous code.
-        agentId: pairingChanged
-          ? ""
-          : config.agentId || process.env.DSH_MANAGER_AGENT_ID || saved.agentId,
-        agentToken: pairingChanged
-          ? ""
-          : config.agentToken ||
-            process.env.DSH_MANAGER_AGENT_TOKEN ||
-            saved.agentToken,
-        // Enrollment is allowed only after the user changes the pairing code.
-        // A revoked Agent must not immediately create a replacement record.
-        allowEnrollment: pairingChanged,
+        serverUrl: settingsSnapshot.serverUrl,
+        pairingCode: settingsSnapshot.pairingCode,
+        // Keep saved credentials even when the enrollment secret changes. A
+        // valid Agent reconnects with its token and never needs pairingCode.
+        agentId:
+          config.agentId || process.env.DSH_MANAGER_AGENT_ID || saved.agentId,
+        agentToken:
+          config.agentToken ||
+          process.env.DSH_MANAGER_AGENT_TOKEN ||
+          saved.agentToken,
+        // A changed pairing code is explicit permission to enroll only if a
+        // replacement is needed. ManagerTunnel otherwise keeps the old token.
+        allowEnrollment:
+          pairingChanged &&
+          String(settingsSnapshot.pairingCode || "").trim() !== "",
         onCredentialsRejected: () => {
+          if (
+            disposed ||
+            generation !== syncGeneration ||
+            tunnel !== localTunnel
+          )
+            return;
           delete saved.agentId;
           delete saved.agentToken;
           writeState(file, saved);
         },
-        tlsFingerprint: settings.tlsFingerprint,
-        name: settings.name,
-        instanceId: settings.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.4",
+        tlsFingerprint: settingsSnapshot.tlsFingerprint,
+        name: settingsSnapshot.name,
+        instanceId: settingsSnapshot.instanceId,
+        pluginVersion: config.pluginVersion || "0.1.5",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
+          if (
+            disposed ||
+            generation !== syncGeneration ||
+            tunnel !== localTunnel
+          )
+            return;
           saved = {
             ...saved,
             ...result,
-            serverUrl: settings.serverUrl,
-            pairingCode: settings.pairingCode,
-            name: settings.name,
+            serverUrl: settingsSnapshot.serverUrl,
+            pairingCode: settingsSnapshot.pairingCode,
+            name: settingsSnapshot.name,
           };
           writeState(file, saved);
           config.onEnrollment?.(result);
         },
       });
-      tunnel.start().catch((error) => {
+      tunnel = localTunnel;
+      // Replace the old transport only after the new generation is visible, so
+      // late close/enrollment callbacks cannot mutate the active generation.
+      previousTunnel?.close();
+      localTunnel.start().catch((error) => {
+        if (
+          disposed ||
+          generation !== syncGeneration ||
+          tunnel !== localTunnel ||
+          error?.code === "MANAGER_TUNNEL_CLOSED"
+        )
+          return;
         console.error("[dsh-manager-plugin] connection failed:", error);
         config.onError?.(error);
       });
