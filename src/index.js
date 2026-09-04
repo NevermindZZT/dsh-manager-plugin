@@ -7,6 +7,7 @@ import {
   settingsNamespace,
 } from "@deepseek-ai/dsh-settings";
 import { ManagerTunnel } from "./tunnel.js";
+import { shouldAllowEnrollment } from "./protocol.js";
 
 export const name = "dsh-manager-plugin";
 export const DSH_MANAGER_SETTINGS_NAMESPACE = settingsNamespace("dsh-manager");
@@ -125,25 +126,34 @@ export default {
       }
 
       let localTunnel;
+      const configuredAgentId =
+        config.agentId ||
+        process.env.DSH_MANAGER_AGENT_ID ||
+        (managerChanged ? "" : saved.agentId) ||
+        "";
+      const configuredAgentToken =
+        config.agentToken ||
+        process.env.DSH_MANAGER_AGENT_TOKEN ||
+        (managerChanged ? "" : saved.agentToken) ||
+        "";
       localTunnel = new ManagerTunnel({
         ...config,
         serverUrl: settingsSnapshot.serverUrl,
         pairingCode: settingsSnapshot.pairingCode,
         // Keep saved credentials even when the enrollment secret changes. A
         // valid Agent reconnects with its token and never needs pairingCode.
-        agentId:
-          config.agentId ||
-          process.env.DSH_MANAGER_AGENT_ID ||
-          (managerChanged ? "" : saved.agentId),
-        agentToken:
-          config.agentToken ||
-          process.env.DSH_MANAGER_AGENT_TOKEN ||
-          (managerChanged ? "" : saved.agentToken),
-        // A changed pairing code is explicit permission to enroll only if a
-        // replacement is needed. ManagerTunnel otherwise keeps the old token.
-        allowEnrollment:
-          (pairingChanged || managerChanged) &&
-          String(settingsSnapshot.pairingCode || "").trim() !== "",
+        agentId: configuredAgentId,
+        agentToken: configuredAgentToken,
+        // A configured pairing code authorizes enrollment when credentials are
+        // absent (including the first run). With valid credentials, only a
+        // changed manager URL/code permits replacement enrollment.
+        allowEnrollment: shouldAllowEnrollment({
+          agentId: configuredAgentId,
+          agentToken: configuredAgentToken,
+          pairingCode: settingsSnapshot.pairingCode,
+          pairingChanged,
+          managerChanged,
+        }),
         onCredentialsRejected: () => {
           if (
             disposed ||
@@ -158,7 +168,7 @@ export default {
         tlsFingerprint: settingsSnapshot.tlsFingerprint,
         name: settingsSnapshot.name,
         instanceId: settingsSnapshot.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.6",
+        pluginVersion: config.pluginVersion || "0.1.7",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
           if (

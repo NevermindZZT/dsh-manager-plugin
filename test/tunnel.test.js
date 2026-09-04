@@ -6,6 +6,7 @@ import https from "node:https";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
+import { shouldAllowEnrollment } from "../src/protocol.js";
 import { ManagerTunnel } from "../src/tunnel.js";
 
 function listen(server) {
@@ -190,6 +191,39 @@ test("HTTPS with no fingerprint rejects a self-signed certificate", async () => 
     await new Promise((resolve) => wss.close(resolve));
     await closeServer(server);
   }
+});
+
+test("first enrollment is allowed when credentials are absent", () => {
+  assert.equal(
+    shouldAllowEnrollment({
+      agentId: "",
+      agentToken: "",
+      pairingCode: "current-code",
+      pairingChanged: false,
+      managerChanged: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAllowEnrollment({
+      agentId: "agent-existing",
+      agentToken: "token-existing",
+      pairingCode: "current-code",
+      pairingChanged: false,
+      managerChanged: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAllowEnrollment({
+      agentId: "",
+      agentToken: "",
+      pairingCode: "",
+      pairingChanged: false,
+      managerChanged: false,
+    }),
+    false,
+  );
 });
 
 test("fingerprint rejects malformed values", () => {

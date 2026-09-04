@@ -41,6 +41,21 @@ export function managerUrls(serverUrl) {
   connect.protocol = base.protocol === "https:" ? "wss:" : "ws:";
   return { base, enroll, connect };
 }
+export function shouldAllowEnrollment({
+  agentId,
+  agentToken,
+  pairingCode,
+  pairingChanged,
+  managerChanged,
+}) {
+  const credentialsMissing =
+    !String(agentId || "").trim() || !String(agentToken || "").trim();
+  const pairingAvailable = String(pairingCode || "").trim() !== "";
+  return (
+    pairingAvailable && (credentialsMissing || pairingChanged || managerChanged)
+  );
+}
+
 export function enrollmentPayload(config) {
   return {
     pairingCode: config.pairingCode || "",
@@ -49,7 +64,7 @@ export function enrollmentPayload(config) {
     launcherVersion: "",
     agentType: "dsh-plugin",
     agentVersion: process.version,
-    pluginVersion: config.pluginVersion || "0.1.6",
+    pluginVersion: config.pluginVersion || "0.1.7",
     capabilities: normalizeCapabilities(
       config.capabilities || DEFAULT_CAPABILITIES,
     ),
