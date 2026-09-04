@@ -1,5 +1,6 @@
 import http from "node:http";
 import https from "node:https";
+import tls from "node:tls";
 import WebSocket from "ws";
 import {
   enrollmentPayload,
@@ -8,9 +9,14 @@ import {
   DEFAULT_CAPABILITIES,
 } from "./protocol.js";
 function fingerprint(value) {
-  return String(value || "")
-    .replace(/[^a-f0-9]/gi, "")
-    .toUpperCase();
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/[\s:.-]/g, "").toUpperCase();
+  if (!/^[A-F0-9]{64}$/.test(normalized))
+    throw new Error(
+      "manager TLS fingerprint must be empty or a 64-character SHA-256 value",
+    );
+  return normalized;
 }
 function tunnelClosedError() {
   const error = new Error("manager tunnel closed");
@@ -18,15 +24,36 @@ function tunnelClosedError() {
   return error;
 }
 function tlsAgent(expected) {
-  return new https.Agent({
-    rejectUnauthorized: false,
-    checkServerIdentity(_host, cert) {
-      if (!expected) return undefined;
-      return fingerprint(cert.fingerprint256) === fingerprint(expected)
-        ? undefined
-        : new Error("manager TLS fingerprint mismatch");
-    },
-  });
+  const expectedFingerprint = fingerprint(expected);
+  if (!expectedFingerprint) return undefined;
+  // Certificate pinning intentionally replaces normal CA validation. The
+  // public-CA path does not use this Agent and keeps Node's normal checks.
+  // Note: https.Agent constructor options do not replace the prototype
+  // createConnection, so assign the implementation on the instance.
+  const agent = new https.Agent({ rejectUnauthorized: false });
+  agent.createConnection = (options, callback) => {
+    const { agent: _ignored, ...connectOptions } = options;
+    const socket = tls.connect(connectOptions);
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      callback?.(error || null, socket);
+    };
+    socket.once("secureConnect", () => {
+      const certificate = socket.getPeerCertificate();
+      if (fingerprint(certificate?.fingerprint256) !== expectedFingerprint) {
+        const error = new Error("manager TLS fingerprint mismatch");
+        socket.destroy(error);
+        finish(error);
+        return;
+      }
+      finish();
+    });
+    socket.once("error", finish);
+    return socket;
+  };
+  return agent;
 }
 function requestJson(url, method, payload, token, expectedFingerprint) {
   return new Promise((resolve, reject) => {
@@ -44,7 +71,9 @@ function requestJson(url, method, payload, token, expectedFingerprint) {
       },
     };
     if (token) options.headers.Authorization = "Bearer " + token;
-    if (secure) options.agent = tlsAgent(expectedFingerprint);
+    const pinnedFingerprint = fingerprint(expectedFingerprint);
+    if (secure && pinnedFingerprint)
+      options.agent = tlsAgent(pinnedFingerprint);
     const req = (secure ? https : http).request(options, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
@@ -56,10 +85,14 @@ function requestJson(url, method, payload, token, expectedFingerprint) {
         } catch {
           value = { error: text };
         }
-        if (res.statusCode < 200 || res.statusCode >= 300)
-          return reject(
-            new Error(value.error || "manager HTTP " + res.statusCode),
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const error = new Error(
+            value.error || "manager HTTP " + res.statusCode,
           );
+          error.code = "MANAGER_HTTP_" + res.statusCode;
+          error.statusCode = res.statusCode;
+          return reject(error);
+        }
         resolve(value);
       });
     });
@@ -74,9 +107,15 @@ export class ManagerTunnel {
   constructor(options) {
     this.options = options;
     this.manager = managerUrls(options.serverUrl);
+    const pinnedFingerprint = fingerprint(options.tlsFingerprint);
     console.info(
       "[dsh-manager-plugin] manager transport:",
       this.manager.base.href,
+      pinnedFingerprint
+        ? "tls=fingerprint"
+        : this.manager.base.protocol === "https:"
+          ? "tls=system-ca"
+          : "tls=plain-http",
       "agentType=dsh-plugin",
     );
     this.capabilities = normalizeCapabilities(
@@ -166,10 +205,12 @@ export class ManagerTunnel {
           Authorization: "Bearer " + this.agentToken,
           "X-Agent-Id": this.agentId,
         },
-        rejectUnauthorized: false,
       };
-      if (this.manager.base.protocol === "https:")
-        wsOptions.agent = tlsAgent(this.options.tlsFingerprint);
+      const pinnedFingerprint = fingerprint(this.options.tlsFingerprint);
+      if (this.manager.base.protocol === "https:" && pinnedFingerprint) {
+        wsOptions.rejectUnauthorized = false;
+        wsOptions.agent = tlsAgent(pinnedFingerprint);
+      }
       const socket = new WebSocket(this.manager.connect, wsOptions);
       this.socket = socket;
       let settled = false;
@@ -213,7 +254,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.1.5",
+          pluginVersion: this.options.pluginVersion || "0.1.6",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });

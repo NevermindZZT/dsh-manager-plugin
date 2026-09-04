@@ -98,6 +98,9 @@ export default {
       const pairingChanged =
         String(saved.pairingCode || "") !==
         String(settingsSnapshot.pairingCode || "");
+      const managerChanged =
+        String(saved.serverUrl || "") !==
+        String(settingsSnapshot.serverUrl || "");
       saved = {
         ...saved,
         serverUrl: settingsSnapshot.serverUrl,
@@ -129,15 +132,17 @@ export default {
         // Keep saved credentials even when the enrollment secret changes. A
         // valid Agent reconnects with its token and never needs pairingCode.
         agentId:
-          config.agentId || process.env.DSH_MANAGER_AGENT_ID || saved.agentId,
+          config.agentId ||
+          process.env.DSH_MANAGER_AGENT_ID ||
+          (managerChanged ? "" : saved.agentId),
         agentToken:
           config.agentToken ||
           process.env.DSH_MANAGER_AGENT_TOKEN ||
-          saved.agentToken,
+          (managerChanged ? "" : saved.agentToken),
         // A changed pairing code is explicit permission to enroll only if a
         // replacement is needed. ManagerTunnel otherwise keeps the old token.
         allowEnrollment:
-          pairingChanged &&
+          (pairingChanged || managerChanged) &&
           String(settingsSnapshot.pairingCode || "").trim() !== "",
         onCredentialsRejected: () => {
           if (
@@ -153,7 +158,7 @@ export default {
         tlsFingerprint: settingsSnapshot.tlsFingerprint,
         name: settingsSnapshot.name,
         instanceId: settingsSnapshot.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.5",
+        pluginVersion: config.pluginVersion || "0.1.6",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         onEnrollment: (result) => {
           if (

@@ -1,6 +1,6 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.1.5-blue)
+![Version](https://img.shields.io/badge/version-v0.1.6-blue)
 [![npm](https://img.shields.io/npm/v/@nevermindzzt/dsh-manager-plugin?logo=npm)](https://www.npmjs.com/package/@nevermindzzt/dsh-manager-plugin)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
@@ -13,7 +13,7 @@
 
 当前版本：
 
-    0.1.5
+    0.1.6
 
 协议保持：
 
@@ -61,7 +61,7 @@
 
 本地 tarball 安装：
 
-    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.5.tgz
+    dsh plugin --profile web add nevermindzzt-dsh-manager-plugin-0.1.6.tgz
 
 安装后重启 dsh：
 
@@ -82,7 +82,7 @@
 - 首次配对码（仅注册时使用）；
 - Agent 名称；
 - 实例 ID；
-- TLS 指纹。
+- TLS 指纹（可选；公共 CA 证书可留空）。
 
 设置卡片默认折叠，使用 dsh 原生 CSS 变量和插件卡片交互样式。保存后插件会重新建立连接；如果没有配置 Manager URL，插件只注册设置项并保持禁用，不会阻塞 dsh web 启动。
 
@@ -101,7 +101,7 @@ HTTPS / WSS（推荐）：
     错误：http://manager.example.com:8443
     正确：https://manager.example.com:8443
 
-HTTPS 模式需要填写 manager 当前证书的 SHA-256 指纹。配对码只在首次注册或明确重新注册时使用；manager 刷新配对码、重启生成新配对码，都不会影响已有 Agent Token 的连接。只有 Agent Token 失效或 manager 更换数据库后，插件才会清理旧凭证并等待用户输入新的配对码。
+HTTPS 模式下，TLS 指纹是可选的：留空时使用 Node.js 系统公共 CA 和主机名校验，适用于 Cloudflare Tunnel / Let's Encrypt 等公共证书；填写 64 位 SHA-256 指纹时则固定到该证书，适用于自签名 manager。配对码只在首次注册或明确重新注册时使用；manager 刷新配对码、重启生成新配对码，都不会影响已有 Agent Token 的连接。只有 Agent Token 失效或 manager 更换数据库后，插件才会清理旧凭证并等待用户输入新的配对码。
 
 ## 环境变量
 
@@ -111,7 +111,7 @@ HTTPS 模式需要填写 manager 当前证书的 SHA-256 指纹。配对码只�
     DSH_MANAGER_PAIRING_CODE=one-time-code
     DSH_MANAGER_NAME=linux-dsh
     DSH_MANAGER_INSTANCE_ID=default
-    DSH_MANAGER_TLS_FINGERPRINT=sha256-fingerprint
+    DSH_MANAGER_TLS_FINGERPRINT=sha256-fingerprint  # 可选；公共 CA 可留空
 
 环境变量适合容器或自动化部署。未配置 DSH_MANAGER_URL 时插件保持禁用。
 
