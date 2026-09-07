@@ -158,7 +158,7 @@ export default {
         },
         name: settingsSnapshot.name,
         instanceId: settingsSnapshot.instanceId,
-        pluginVersion: config.pluginVersion || "0.2.1",
+        pluginVersion: config.pluginVersion || "0.2.2",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
         startupUrl: ctx.connection.authenticatedUrl(
           "http://127.0.0.1:" + ctx.webServer.port,
