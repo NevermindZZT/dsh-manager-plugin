@@ -45,13 +45,18 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "ws": "^8.18.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-host-webserver": ">=0.1.2-rc.1"
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-settings": ">=0.1.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "prettier": "^3.6.2"

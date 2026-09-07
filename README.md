@@ -4,8 +4,7 @@
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-在 dsh 进程内建立 dsh-manager 反向连接的插件。安装后不需要 dsh-launcher，也可以将当前 dsh 实例注册到 dsh-manager，并通过 manager 访问 dsh Web UI。
-
+本版本使用 DSH `0.1.2-rc.1` 提供的 `ctx.settings.installSection()` API，不再导入已移除的 `settingsNamespace` 或 `installSettingsSection` 顶层导出。
 ## 0.2.0 transport migration
 
 - 移除私有证书、TLS fingerprint 和证书 pinning；

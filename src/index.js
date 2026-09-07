@@ -2,15 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import z from "@deepseek-ai/schemastery";
-import {
-  installSettingsSection,
-  settingsNamespace,
-} from "@deepseek-ai/dsh-settings";
 import { ManagerTunnel } from "./tunnel.js";
 import { shouldAllowEnrollment } from "./protocol.js";
 
 export const name = "dsh-manager-plugin";
-export const DSH_MANAGER_SETTINGS_NAMESPACE = settingsNamespace("dsh-manager");
+export const DSH_MANAGER_SETTINGS_NAMESPACE = "dsh-manager";
 export const DSH_MANAGER_SETTINGS_SCHEMA = z.object({
   enabled: z.boolean(),
   serverUrl: z.string(),
@@ -213,20 +209,22 @@ export default {
       timer.unref?.();
     };
 
-    installSettingsSection(
-      ctx,
-      DSH_MANAGER_SETTINGS_NAMESPACE,
-      DSH_MANAGER_SETTINGS_SCHEMA,
-      entry,
-      {
-        setSource: (current) => {
-          source = current;
-          sourceReady = true;
-          scheduleSync();
+    ctx.inject(["settings"], (sctx) => {
+      sctx.settings.installSection(
+        ctx,
+        DSH_MANAGER_SETTINGS_NAMESPACE,
+        DSH_MANAGER_SETTINGS_SCHEMA,
+        entry,
+        {
+          setSource: (current) => {
+            source = current;
+            sourceReady = true;
+            scheduleSync();
+          },
+          onChange: scheduleSync,
         },
-        onChange: scheduleSync,
-      },
-    );
+      );
+    });
     const readinessTimer = setTimeout(() => {
       if (!sourceReady) {
         sourceReady = true;
