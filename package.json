@@ -1,6 +1,6 @@
 {
   "name": "@nevermindzzt/dsh-manager-plugin",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Direct dsh-manager reverse tunnel plugin for DeepSeek Harness",
   "type": "module",
   "main": "src/index.js",
@@ -45,13 +45,13 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "ws": "^8.18.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-host-webserver": ">=0.1.1-rc.2"
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.2-rc.1"
   },
   "devDependencies": {
     "prettier": "^3.6.2"

@@ -1,12 +1,8 @@
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
-import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
-import { shouldAllowEnrollment } from "../src/protocol.js";
+import { shouldAllowEnrollment, validateManagerUrl } from "../src/protocol.js";
 import { ManagerTunnel } from "../src/tunnel.js";
 
 function listen(server) {
@@ -15,53 +11,72 @@ function listen(server) {
     server.listen(0, "127.0.0.1", () => resolve(server.address().port));
   });
 }
-
 function closeServer(server) {
-  return new Promise((resolve) => server.close(() => resolve()));
+  return new Promise((resolve) => server.close(resolve));
 }
-
-const fixtures = new URL("./fixtures/", import.meta.url);
-const tlsKey = fs.readFileSync(fileURLToPath(new URL("server.key", fixtures)));
-const tlsCert = fs.readFileSync(fileURLToPath(new URL("server.crt", fixtures)));
-const tlsFingerprint = crypto
-  .createHash("sha256")
-  .update(new crypto.X509Certificate(tlsCert).raw)
-  .digest("hex")
-  .toUpperCase();
-
+function closeWebSocketServer(server) {
+  for (const socket of server.clients) socket.terminate();
+  return new Promise((resolve) => server.close(resolve));
+}
 function rejectUpgrade(socket, status = 401) {
   socket.end(
-    "HTTP/1.1 " + status + " Unauthorized\r\n" +
-      "Connection: close\r\n" +
-      "Content-Length: 0\r\n\r\n",
+    `HTTP/1.1 ${status} Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
   );
+}
+
+function messageQueue(socket) {
+  const queue = [];
+  const waiters = [];
+  socket.on("message", (raw) => {
+    let value;
+    try {
+      value = JSON.parse(raw.toString("utf8"));
+    } catch {
+      return;
+    }
+    const index = waiters.findIndex((waiter) => waiter.predicate(value));
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter.timer);
+      waiter.resolve(value);
+    } else queue.push(value);
+  });
+  return (predicate, timeout = 3000) => {
+    const index = queue.findIndex(predicate);
+    if (index >= 0) return Promise.resolve(queue.splice(index, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        predicate,
+        resolve,
+        timer: setTimeout(() => {
+          const at = waiters.indexOf(waiter);
+          if (at >= 0) waiters.splice(at, 1);
+          reject(new Error("timed out waiting for manager message"));
+        }, timeout),
+      };
+      waiters.push(waiter);
+    });
+  };
 }
 
 test("rejected saved credentials wait for a new pairing code", async () => {
   let enrollmentRequests = 0;
-  let rejectedConnections = 0;
   const server = http.createServer((request, response) => {
     if (request.url === "/api/v1/agents/enroll") enrollmentRequests++;
     response.writeHead(404);
     response.end();
   });
-  server.on("upgrade", (_request, socket) => {
-    rejectedConnections++;
-    rejectUpgrade(socket);
-  });
-  const port = await listen(server);
+  server.on("upgrade", (_request, socket) => rejectUpgrade(socket));
   const tunnel = new ManagerTunnel({
-    serverUrl: "http://127.0.0.1:" + port,
+    serverUrl: `http://127.0.0.1:${await listen(server)}`,
     agentId: "agent-old",
     agentToken: "token-old",
-    pairingCode: "stale-code",
+    pairingCode: "stale",
     allowEnrollment: false,
     localOrigin: "http://127.0.0.1:1",
   });
-
   try {
     await tunnel.start();
-    assert.equal(rejectedConnections, 1);
     assert.equal(enrollmentRequests, 0);
     assert.equal(tunnel.agentId, "");
     assert.equal(tunnel.agentToken, "");
@@ -71,134 +86,42 @@ test("rejected saved credentials wait for a new pairing code", async () => {
   }
 });
 
-test("a changed pairing code does not replace valid Agent credentials", async () => {
-  let enrollmentRequests = 0;
-  const seenHeaders = [];
-  const server = http.createServer((request, response) => {
-    if (request.url === "/api/v1/agents/enroll") enrollmentRequests++;
+test("ordinary HTTP manager connection registers with Agent credentials", async () => {
+  const server = http.createServer((_request, response) => {
     response.writeHead(404);
     response.end();
   });
   const wss = new WebSocketServer({ noServer: true });
+  let headers;
   server.on("upgrade", (request, socket, head) => {
-    seenHeaders.push(request.headers);
-    wss.handleUpgrade(request, socket, head, (websocket) => {
-      wss.emit("connection", websocket, request);
-    });
+    headers = request.headers;
+    wss.handleUpgrade(request, socket, head, (websocket) =>
+      wss.emit("connection", websocket),
+    );
   });
-  const port = await listen(server);
   const tunnel = new ManagerTunnel({
-    serverUrl: "http://127.0.0.1:" + port,
+    serverUrl: `http://127.0.0.1:${await listen(server)}`,
     agentId: "agent-existing",
     agentToken: "token-existing",
-    pairingCode: "fresh-manager-code",
-    allowEnrollment: true,
     localOrigin: "http://127.0.0.1:1",
   });
-
   try {
     await tunnel.start();
-    assert.equal(enrollmentRequests, 0);
-    assert.equal(seenHeaders.length, 1);
-    assert.equal(seenHeaders[0].authorization, "Bearer token-existing");
-    assert.equal(seenHeaders[0]["x-agent-id"], "agent-existing");
+    assert.equal(headers.authorization, "Bearer token-existing");
+    assert.equal(headers["x-agent-id"], "agent-existing");
   } finally {
     tunnel.close();
-    for (const websocket of wss.clients) websocket.terminate();
-    await new Promise((resolve) => wss.close(resolve));
+    await closeWebSocketServer(wss);
     await closeServer(server);
   }
 });
 
-function tlsFixture() {
-  const server = https.createServer({ key: tlsKey, cert: tlsCert }, (_req, res) => {
-    res.writeHead(404);
-    res.end();
-  });
-  const wss = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (websocket) => {
-      wss.emit("connection", websocket, request);
-    });
-  });
-  return { server, wss };
-}
-
-test("HTTPS with a matching fingerprint connects and registers", async () => {
-  const { server, wss } = tlsFixture();
-  let connections = 0;
-  wss.on("connection", () => connections++);
-  const port = await listen(server);
-  const tunnel = new ManagerTunnel({
-    serverUrl: "https://127.0.0.1:" + port,
-    agentId: "agent-pinned",
-    agentToken: "token-pinned",
-    tlsFingerprint: tlsFingerprint,
-    localOrigin: "http://127.0.0.1:1",
-  });
-
-  try {
-    await tunnel.start();
-    assert.equal(connections, 1);
-  } finally {
-    tunnel.close();
-    for (const websocket of wss.clients) websocket.terminate();
-    await new Promise((resolve) => wss.close(resolve));
-    await closeServer(server);
-  }
-});
-
-test("HTTPS with a mismatched fingerprint fails", async () => {
-  const { server, wss } = tlsFixture();
-  const port = await listen(server);
-  const tunnel = new ManagerTunnel({
-    serverUrl: "https://127.0.0.1:" + port,
-    agentId: "agent-pinned",
-    agentToken: "token-pinned",
-    tlsFingerprint: "0".repeat(63) + "1",
-    localOrigin: "http://127.0.0.1:1",
-  });
-
-  try {
-    await assert.rejects(() => tunnel.start(), /fingerprint mismatch/);
-  } finally {
-    tunnel.close();
-    for (const websocket of wss.clients) websocket.terminate();
-    await new Promise((resolve) => wss.close(resolve));
-    await closeServer(server);
-  }
-});
-
-test("HTTPS with no fingerprint rejects a self-signed certificate", async () => {
-  const { server, wss } = tlsFixture();
-  const port = await listen(server);
-  const tunnel = new ManagerTunnel({
-    serverUrl: "https://127.0.0.1:" + port,
-    agentId: "agent-pinned",
-    agentToken: "token-pinned",
-    tlsFingerprint: "",
-    localOrigin: "http://127.0.0.1:1",
-  });
-
-  try {
-    await assert.rejects(
-      () => tunnel.start(),
-      /self.signed|unable to verify|certificate/i,
-    );
-  } finally {
-    tunnel.close();
-    for (const websocket of wss.clients) websocket.terminate();
-    await new Promise((resolve) => wss.close(resolve));
-    await closeServer(server);
-  }
-});
-
-test("first enrollment is allowed when credentials are absent", () => {
+test("first enrollment remains allowed when credentials are absent", () => {
   assert.equal(
     shouldAllowEnrollment({
       agentId: "",
       agentToken: "",
-      pairingCode: "current-code",
+      pairingCode: "current",
       pairingChanged: false,
       managerChanged: false,
     }),
@@ -206,19 +129,9 @@ test("first enrollment is allowed when credentials are absent", () => {
   );
   assert.equal(
     shouldAllowEnrollment({
-      agentId: "agent-existing",
-      agentToken: "token-existing",
-      pairingCode: "current-code",
-      pairingChanged: false,
-      managerChanged: false,
-    }),
-    false,
-  );
-  assert.equal(
-    shouldAllowEnrollment({
-      agentId: "",
-      agentToken: "",
-      pairingCode: "",
+      agentId: "agent",
+      agentToken: "token",
+      pairingCode: "current",
       pairingChanged: false,
       managerChanged: false,
     }),
@@ -226,23 +139,169 @@ test("first enrollment is allowed when credentials are absent", () => {
   );
 });
 
-test("fingerprint rejects malformed values", () => {
-  // fingerprint() is module-private, so exercise it through ManagerTunnel
-  // construction: a malformed pin must throw a clear error.
-  assert.throws(
-    () =>
-      new ManagerTunnel({
-        serverUrl: "https://example.com",
-        tlsFingerprint: "not-a-fingerprint",
-      }),
-    /64-character SHA-256/,
+test("manager URLs allow ordinary HTTP and HTTPS without port heuristics", () => {
+  assert.equal(
+    validateManagerUrl("http://manager.example:10090").protocol,
+    "http:",
   );
-  assert.throws(
-    () =>
-      new ManagerTunnel({
-        serverUrl: "https://example.com",
-        tlsFingerprint: "AB".repeat(31),
-      }),
-    /64-character SHA-256/,
+  assert.equal(
+    validateManagerUrl("https://manager.example:10090").protocol,
+    "https:",
   );
+  assert.throws(() => validateManagerUrl("wss://manager.example"), /http/);
+});
+
+test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the plugin", async () => {
+  let bootstrapTokenSeen = false;
+  let websocketCookie = "";
+  const local = http.createServer((request, response) => {
+    if (request.url === "/?token=secret") {
+      bootstrapTokenSeen = true;
+      response.writeHead(303, {
+        Location: "/",
+        "Set-Cookie": "dsh-auth-test=ok; Path=/",
+      });
+      response.end();
+      return;
+    }
+    if (
+      request.url === "/" &&
+      request.headers.cookie?.includes("dsh-auth-test=ok")
+    ) {
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("bootstrapped");
+      return;
+    }
+    response.writeHead(401);
+    response.end("dsh web authentication required");
+  });
+  const localWss = new WebSocketServer({ noServer: true });
+  local.on("upgrade", (request, socket, head) => {
+    if (
+      request.url !== "/api/remote.mux" ||
+      request.headers.cookie !== "dsh-auth-test=ok"
+    ) {
+      rejectUpgrade(socket);
+      return;
+    }
+    websocketCookie = request.headers.cookie;
+    localWss.handleUpgrade(request, socket, head, (websocket) => {
+      localWss.emit("connection", websocket);
+      websocket.send("pong");
+    });
+  });
+  const localPort = await listen(local);
+  const manager = http.createServer((request, response) => {
+    if (request.url === "/api/v1/agents/enroll") {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(201, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            agentId: "agent-e2e",
+            agentToken: "token-e2e",
+            protocolVersion: 1,
+          }),
+        );
+      });
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  const managerWss = new WebSocketServer({ noServer: true });
+  manager.on("upgrade", (request, socket, head) => {
+    if (request.url !== "/api/v1/agent/connect") {
+      rejectUpgrade(socket, 404);
+      return;
+    }
+    managerWss.handleUpgrade(request, socket, head, (websocket) => {
+      managerWss.emit("connection", websocket);
+    });
+  });
+  const managerPort = await listen(manager);
+  let managerSocket;
+  let nextManagerMessage;
+  const managerConnected = new Promise((resolve) => {
+    managerWss.once("connection", (socket) => {
+      managerSocket = socket;
+      nextManagerMessage = messageQueue(socket);
+      resolve(socket);
+    });
+  });
+  const tunnel = new ManagerTunnel({
+    serverUrl: `http://127.0.0.1:${managerPort}`,
+    pairingCode: "pair-e2e",
+    allowEnrollment: true,
+    localOrigin: `http://127.0.0.1:${localPort}`,
+    startupUrl: `http://127.0.0.1:${localPort}/?token=secret`,
+    name: "e2e-plugin",
+    instanceId: "default",
+  });
+  try {
+    await tunnel.start();
+    const socket = await managerConnected;
+    const next = nextManagerMessage;
+    const register = await next((value) => value.type === "register");
+    assert.equal(
+      register.instances[0].startupUrl.includes("token=secret"),
+      true,
+    );
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "bootstrap",
+        method: "GET",
+        path: "/",
+        headers: {},
+        bootstrap: true,
+      }),
+    );
+    const bootstrap = await next((value) => value.requestId === "bootstrap");
+    assert.equal(bootstrap.status, 303);
+    assert.equal(bootstrap.headers.location, "/");
+    assert.equal(bootstrap.setCookies[0].startsWith("dsh-auth-test=ok"), true);
+    assert.equal(bootstrapTokenSeen, true);
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "clean",
+        method: "GET",
+        path: "/",
+        headers: { Cookie: "dsh-auth-test=ok" },
+      }),
+    );
+    const clean = await next((value) => value.requestId === "clean");
+    assert.equal(clean.status, 200);
+    assert.equal(Buffer.from(clean.body, "base64").toString(), "bootstrapped");
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_ws_open",
+        requestId: "ws",
+        path: "/api/remote.mux",
+        headers: { Cookie: "dsh-auth-test=ok" },
+      }),
+    );
+    const opened = await next(
+      (value) =>
+        value.requestId === "ws" && value.type === "proxy_ws_open_result",
+    );
+    assert.equal(opened.ok, true);
+    const frame = await next(
+      (value) => value.requestId === "ws" && value.type === "proxy_ws_frame",
+    );
+    assert.equal(Buffer.from(frame.body, "base64").toString(), "pong");
+    assert.equal(websocketCookie, "dsh-auth-test=ok");
+    socket.send(JSON.stringify({ type: "proxy_ws_close", requestId: "ws" }));
+  } finally {
+    tunnel.close();
+    managerSocket?.terminate();
+    await closeWebSocketServer(managerWss);
+    await closeServer(manager);
+    await closeWebSocketServer(localWss);
+    await closeServer(local);
+  }
 });

@@ -25,7 +25,6 @@ const FIELDS = [
   ["pairingCode", "首次配对码（仅注册时使用）"],
   ["name", "Agent 名称"],
   ["instanceId", "实例 ID"],
-  ["tlsFingerprint", "TLS 指纹（可选；公共 CA 可留空）"],
 ];
 
 function valueOf(snapshot) {
@@ -36,7 +35,6 @@ function valueOf(snapshot) {
     pairingCode: String(value.pairingCode || ""),
     name: String(value.name || "dsh-plugin"),
     instanceId: String(value.instanceId || "default"),
-    tlsFingerprint: String(value.tlsFingerprint || ""),
   };
 }
 
@@ -67,16 +65,6 @@ function ManagerSettingsCard({ scope }) {
     const validationError = validateServerUrl(current.serverUrl);
     if (validationError) {
       setError(validationError);
-      return;
-    }
-    const normalizedFingerprint = String(current.tlsFingerprint || "")
-      .replace(/[\s:.-]/g, "")
-      .toUpperCase();
-    if (
-      normalizedFingerprint &&
-      !/^[A-F0-9]{64}$/.test(normalizedFingerprint)
-    ) {
-      setError("TLS 指纹必须是 64 位 SHA-256，或留空以信任公共 CA");
       return;
     }
     try {
@@ -162,10 +150,7 @@ function ManagerSettingsCard({ scope }) {
                       }),
                       jsx("input", {
                         className: "dsh-manager-input",
-                        type:
-                          field === "pairingCode" || field === "tlsFingerprint"
-                            ? "password"
-                            : "text",
+                        type: field === "pairingCode" ? "password" : "text",
                         value: current[field],
                         onChange: (event) => edit(field, event.target.value),
                       }),

@@ -3,6 +3,7 @@ export const DEFAULT_CAPABILITIES = [
   "proxy.websocket",
   "settings.host",
   "plugin.config",
+  "dsh.web.bootstrap-v1",
 ];
 export function normalizeCapabilities(values) {
   const seen = new Set();
@@ -20,17 +21,8 @@ export function normalizeCapabilities(values) {
 }
 export function validateManagerUrl(serverUrl) {
   const url = new URL(serverUrl);
-  const port = url.port;
-  const httpsPorts = new Set(["443", "8443", "18443", "19443", "10091"]);
-  const httpPorts = new Set(["80", "8080", "18080", "19080", "10090"]);
-  if (url.protocol === "http:" && httpsPorts.has(port))
-    throw new Error(
-      "Manager URL 使用了 HTTP，但当前端口是 HTTPS/WSS 端口；请改为 https://",
-    );
-  if (url.protocol === "https:" && httpPorts.has(port))
-    throw new Error(
-      "Manager URL 使用了 HTTPS，但当前端口是 HTTP 端口；请改为 http:// 或填写 Agent HTTPS 端口",
-    );
+  if (url.protocol !== "http:" && url.protocol !== "https:")
+    throw new Error("Manager URL 必须使用 http:// 或 https://");
   return url;
 }
 
@@ -64,7 +56,7 @@ export function enrollmentPayload(config) {
     launcherVersion: "",
     agentType: "dsh-plugin",
     agentVersion: process.version,
-    pluginVersion: config.pluginVersion || "0.1.7",
+    pluginVersion: config.pluginVersion || "0.2.0",
     capabilities: normalizeCapabilities(
       config.capabilities || DEFAULT_CAPABILITIES,
     ),

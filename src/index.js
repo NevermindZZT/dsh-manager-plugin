@@ -17,7 +17,6 @@ export const DSH_MANAGER_SETTINGS_SCHEMA = z.object({
   pairingCode: z.string(),
   name: z.string(),
   instanceId: z.string(),
-  tlsFingerprint: z.string(),
 });
 
 function statePath(config) {
@@ -46,7 +45,7 @@ function writeState(file, value) {
 
 export default {
   name,
-  inject: ["webServer"],
+  inject: ["webServer", "connection"],
   apply(ctx, config = {}) {
     const file = statePath(config);
     let saved = readState(file);
@@ -69,8 +68,6 @@ export default {
         "dsh-plugin",
       instanceId:
         config.instanceId || process.env.DSH_MANAGER_INSTANCE_ID || "default",
-      tlsFingerprint:
-        config.tlsFingerprint || process.env.DSH_MANAGER_TLS_FINGERPRINT || "",
     };
     let source = () => entry;
     let sourceReady = false;
@@ -90,7 +87,6 @@ export default {
         pairingCode: settings.pairingCode,
         name: settings.name,
         instanceId: settings.instanceId,
-        tlsFingerprint: settings.tlsFingerprint,
       });
       if (settingsKey === lastSettingsKey) return;
       lastSettingsKey = settingsKey;
@@ -108,7 +104,6 @@ export default {
         pairingCode: settingsSnapshot.pairingCode,
         name: settingsSnapshot.name,
         instanceId: settingsSnapshot.instanceId,
-        tlsFingerprint: settingsSnapshot.tlsFingerprint,
       };
       // Pairing codes are enrollment secrets, not connection credentials. A
       // changed code must never discard a valid Agent token; it is only made
@@ -165,11 +160,13 @@ export default {
           delete saved.agentToken;
           writeState(file, saved);
         },
-        tlsFingerprint: settingsSnapshot.tlsFingerprint,
         name: settingsSnapshot.name,
         instanceId: settingsSnapshot.instanceId,
-        pluginVersion: config.pluginVersion || "0.1.7",
+        pluginVersion: config.pluginVersion || "0.2.0",
         localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
+        startupUrl: ctx.connection.authenticatedUrl(
+          "http://127.0.0.1:" + ctx.webServer.port,
+        ),
         onEnrollment: (result) => {
           if (
             disposed ||
