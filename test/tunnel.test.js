@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { WebSocketServer } from "ws";
 import { shouldAllowEnrollment, validateManagerUrl } from "../src/protocol.js";
 import { ManagerTunnel } from "../src/tunnel.js";
@@ -52,6 +53,46 @@ function messageQueue(socket) {
           const at = waiters.indexOf(waiter);
           if (at >= 0) waiters.splice(at, 1);
           reject(new Error("timed out waiting for manager message"));
+        }, timeout),
+      };
+      waiters.push(waiter);
+    });
+  };
+}
+
+function binaryMessageQueue(socket) {
+  const queue = [];
+  const waiters = [];
+  socket.on("message", (raw, isBinary) => {
+    if (!isBinary) return;
+    const data = Buffer.from(raw);
+    const separator = data.indexOf(10);
+    if (separator <= 0) return;
+    let value;
+    try {
+      value = JSON.parse(data.subarray(0, separator).toString("utf8"));
+    } catch {
+      return;
+    }
+    value.bodyBytes = data.subarray(separator + 1);
+    const index = waiters.findIndex((waiter) => waiter.predicate(value));
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter.timer);
+      waiter.resolve(value);
+    } else queue.push(value);
+  });
+  return (predicate, timeout = 3000) => {
+    const index = queue.findIndex(predicate);
+    if (index >= 0) return Promise.resolve(queue.splice(index, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        predicate,
+        resolve,
+        timer: setTimeout(() => {
+          const at = waiters.indexOf(waiter);
+          if (at >= 0) waiters.splice(at, 1);
+          reject(new Error("timed out waiting for binary manager message"));
         }, timeout),
       };
       waiters.push(waiter);
@@ -168,8 +209,23 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
       request.url === "/" &&
       request.headers.cookie?.includes("dsh-auth-test=ok")
     ) {
-      response.writeHead(200, { "Content-Type": "text/plain" });
-      response.end("bootstrapped");
+      const body = gzipSync(Buffer.from("bootstrapped"));
+      response.writeHead(200, {
+        "Content-Type": "text/plain",
+        "Content-Encoding": "gzip",
+        Vary: "Accept-Encoding",
+      });
+      response.end(body);
+      return;
+    }
+    if (request.url === "/assets/test.js") {
+      const body = gzipSync(Buffer.from("binary-asset"));
+      response.writeHead(200, {
+        "Content-Type": "text/javascript",
+        "Content-Encoding": "gzip",
+        Vary: "Accept-Encoding",
+      });
+      response.end(body);
       return;
     }
     response.writeHead(401);
@@ -222,10 +278,12 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
   const managerPort = await listen(manager);
   let managerSocket;
   let nextManagerMessage;
+  let nextBinaryManagerMessage;
   const managerConnected = new Promise((resolve) => {
     managerWss.once("connection", (socket) => {
       managerSocket = socket;
       nextManagerMessage = messageQueue(socket);
+      nextBinaryManagerMessage = binaryMessageQueue(socket);
       resolve(socket);
     });
   });
@@ -275,7 +333,28 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
     );
     const clean = await next((value) => value.requestId === "clean");
     assert.equal(clean.status, 200);
-    assert.equal(Buffer.from(clean.body, "base64").toString(), "bootstrapped");
+    assert.equal(clean.headers["content-encoding"], "gzip");
+    assert.equal(
+      gunzipSync(Buffer.from(clean.body, "base64")).toString(),
+      "bootstrapped",
+    );
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "binary",
+        method: "GET",
+        path: "/assets/test.js",
+        headers: { Cookie: "dsh-auth-test=ok", "Accept-Encoding": "gzip" },
+        binaryResponse: true,
+      }),
+    );
+    const binary = await nextBinaryManagerMessage(
+      (value) => value.requestId === "binary",
+    );
+    assert.equal(binary.type, "proxy_response_binary");
+    assert.equal(binary.headers["content-encoding"], "gzip");
+    assert.equal(gunzipSync(binary.bodyBytes).toString(), "binary-asset");
 
     socket.send(
       JSON.stringify({

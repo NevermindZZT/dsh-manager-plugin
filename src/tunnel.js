@@ -12,6 +12,56 @@ function tunnelClosedError() {
   error.code = "MANAGER_TUNNEL_CLOSED";
   return error;
 }
+const proxyRequestTimeoutMs = 5 * 60 * 1000;
+function deleteHeader(headers, name) {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === name.toLowerCase()) delete headers[key];
+  }
+}
+function headerValue(headers, name) {
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === name.toLowerCase()) return String(value || "");
+  }
+  return "";
+}
+function acceptsGzip(value) {
+  return String(value || "")
+    .split(",")
+    .some(
+      (item) => item.trim().split(";", 1)[0].trim().toLowerCase() === "gzip",
+    );
+}
+function requestRaw(url, method, headers, body) {
+  return new Promise((resolve, reject) => {
+    const secure = url.protocol === "https:";
+    const options = {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (secure ? 443 : 80),
+      path: url.pathname + url.search,
+      method,
+      headers,
+    };
+    const req = (secure ? https : http).request(options, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () =>
+        resolve({
+          status: res.statusCode || 502,
+          headers: res.headers,
+          body: Buffer.concat(chunks),
+        }),
+      );
+      res.on("aborted", () => reject(new Error("local dsh response aborted")));
+    });
+    req.setTimeout(proxyRequestTimeoutMs, () => {
+      req.destroy(new Error("local dsh request timed out"));
+    });
+    req.on("error", reject);
+    if (body && body.length > 0) req.write(body);
+    req.end();
+  });
+}
 function requestJson(url, method, payload, token) {
   return new Promise((resolve, reject) => {
     const body = payload === undefined ? "" : JSON.stringify(payload);
@@ -284,6 +334,14 @@ export class ManagerTunnel {
     if (this.socket?.readyState === WebSocket.OPEN)
       this.socket.send(JSON.stringify(value));
   }
+  sendBinary(value, body) {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    const header = Buffer.from(
+      JSON.stringify({ ...value, type: "proxy_response_binary" }) + "\n",
+      "utf8",
+    );
+    this.socket.send(Buffer.concat([header, body]));
+  }
   async handleMessage(raw) {
     let message;
     try {
@@ -329,17 +387,21 @@ export class ManagerTunnel {
         message.method || "GET",
         message.path,
       );
-      delete headers.host;
-      delete headers.connection;
-      delete headers.upgrade;
-      delete headers["X-Dsh-Manager-Bootstrap"];
-      delete headers["X-Dsh-Manager-Session"];
-      // Node fetch transparently decompresses responses. Ask dsh for plain
-      // bytes so the browser never receives a stale Content-Encoding header.
-      for (const key of Object.keys(headers)) {
-        if (key.toLowerCase() === "accept-encoding") delete headers[key];
-      }
-      headers["accept-encoding"] = "identity";
+      deleteHeader(headers, "host");
+      deleteHeader(headers, "connection");
+      deleteHeader(headers, "upgrade");
+      deleteHeader(headers, "content-length");
+      deleteHeader(headers, "transfer-encoding");
+      deleteHeader(headers, "content-encoding");
+      deleteHeader(headers, "X-Dsh-Manager-Bootstrap");
+      deleteHeader(headers, "X-Dsh-Manager-Session");
+      const acceptedEncoding = headerValue(message.headers, "accept-encoding");
+      deleteHeader(headers, "accept-encoding");
+      // DSH currently serves gzip. Use the raw node:http response path below so
+      // compressed bytes and Set-Cookie headers survive the Agent tunnel.
+      headers["accept-encoding"] = acceptsGzip(acceptedEncoding)
+        ? "gzip"
+        : "identity";
       const localOrigin = this.options.localOrigin.replace(/\/$/, "");
       for (const key of Object.keys(headers)) {
         const lower = key.toLowerCase();
@@ -348,44 +410,56 @@ export class ManagerTunnel {
       }
       const body = message.body
         ? Buffer.from(message.body, "base64")
-        : undefined;
-      const response = await fetch(target, {
-        method: message.method || "GET",
+        : Buffer.alloc(0);
+      if (body.length > 0) headers["content-length"] = String(body.length);
+      const response = await requestRaw(
+        target,
+        message.method || "GET",
         headers,
         body,
-        redirect: "manual",
-      });
-      const bytes = Buffer.from(await response.arrayBuffer());
+      );
+      const bytes = response.body;
       const resultHeaders = {};
-      const setCookies = response.headers.getSetCookie?.() || [];
-      response.headers.forEach((value, key) => {
+      const setCookies = Array.isArray(response.headers["set-cookie"])
+        ? response.headers["set-cookie"]
+        : [];
+      for (const [key, value] of Object.entries(response.headers)) {
         if (
-          ![
+          value === undefined ||
+          [
             "connection",
             "transfer-encoding",
             "content-length",
-            "content-encoding",
             "set-cookie",
           ].includes(key.toLowerCase())
         )
-          resultHeaders[key] = value;
-      });
+          continue;
+        resultHeaders[key] = Array.isArray(value) ? value.join(", ") : value;
+      }
       console.info(
         "[dsh-manager-plugin] proxy response:",
         message.method || "GET",
         message.path,
         response.status,
         bytes.length + " bytes",
+        response.headers["content-encoding"] || "identity",
         setCookies.length + " cookies",
       );
-      this.send({
+      const metadata = {
         type: "proxy_response",
         requestId: message.requestId,
         status: response.status,
         headers: resultHeaders,
         setCookies,
-        body: bytes.toString("base64"),
-      });
+      };
+      if (message.binaryResponse === true) {
+        this.sendBinary(metadata, bytes);
+      } else {
+        this.send({
+          ...metadata,
+          body: bytes.toString("base64"),
+        });
+      }
     } catch (error) {
       console.error(
         "[dsh-manager-plugin] proxy request failed:",

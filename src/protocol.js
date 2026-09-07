@@ -4,6 +4,7 @@ export const DEFAULT_CAPABILITIES = [
   "settings.host",
   "plugin.config",
   "dsh.web.bootstrap-v1",
+  "proxy.binary-response-v1",
 ];
 export function normalizeCapabilities(values) {
   const seen = new Set();

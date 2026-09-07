@@ -13,7 +13,9 @@
 - 公网 HTTPS/WSS 由 Cloudflare Tunnel 或其他反向代理终止，manager upstream 仍使用 HTTP；
 - DSH 0.1.2-rc.1 startup URL 只在内存中保存，绝不写入 plugin state 或日志；
 - 首个 manager 标记的根请求使用 startup token，随后通过 Cookie 使用干净 URL；
-- WebSocket tunnel 会转发浏览器 Cookie。
+- WebSocket tunnel 会转发浏览器 Cookie；
+- 对浏览器支持 gzip 的请求保留 DSH gzip 响应，避免在 Agent WebSocket 上传输未压缩静态资源；
+- 与支持 `proxy.binary-response-v1` 的 manager 使用二进制响应帧，避免 HTTP 响应 body 再次 Base64 编码。
 
 ## 架构
 
@@ -36,7 +38,7 @@ dsh-manager-plugin
 - WS/WSS Agent 长连接（WSS 由外部代理提供）；
 - HTTP 请求反向代理；
 - WebSocket 双向代理；
-- settings.host、plugin.config 和 `dsh.web.bootstrap-v1` 能力声明；
+- settings.host、plugin.config、`dsh.web.bootstrap-v1` 和 `proxy.binary-response-v1` 能力声明；
 - Agent Token 本地持久化；
 - pairing code 刷新不会使已有 Agent Token 失效；
 - 不支持任意 shell 和远程生命周期命令。
@@ -127,7 +129,7 @@ npm install
 npm test
 ```
 
-测试覆盖 HTTP manager transport、enrollment 生命周期、DSH startup bootstrap、Set-Cookie、HTTP proxy 和 authenticated WebSocket Cookie forwarding。
+测试覆盖 HTTP manager transport、enrollment 生命周期、DSH startup bootstrap、Set-Cookie、gzip 响应保留、二进制 HTTP 响应帧、HTTP proxy 和 authenticated WebSocket Cookie forwarding。
 
 ## 相关项目
 
