@@ -246,7 +246,7 @@ export class ManagerTunnel {
           name: this.options.name || "dsh-plugin",
           agentType: "dsh-plugin",
           agentVersion: process.version,
-          pluginVersion: this.options.pluginVersion || "0.2.0",
+          pluginVersion: this.options.pluginVersion || "0.2.1",
           capabilities: this.capabilities,
           instances: [this.instance()],
         });
