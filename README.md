@@ -1,11 +1,11 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.2.2-blue)
+![Version](https://img.shields.io/badge/version-v0.2.3-blue)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 本版本使用 DSH `0.1.2-rc.1` 提供的 `ctx.settings.installSection()` API，不再导入已移除的 `settingsNamespace` 或 `installSettingsSection` 顶层导出。
-## 0.2.2 transport migration
+## 0.2.3 transport and relay optimization
 
 - 移除私有证书、TLS fingerprint 和证书 pinning；
 - manager 使用单一 HTTP upstream 端口；
@@ -46,7 +46,7 @@ dsh-manager-plugin
 ## 安装
 
 ```powershell
-dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.2.2
+dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.2.3
 ```
 
 安装后重启 dsh：

@@ -61,7 +61,7 @@ export function enrollmentPayload(config) {
     launcherVersion: "",
     agentType: "dsh-plugin",
     agentVersion: process.version,
-    pluginVersion: config.pluginVersion || "0.2.2",
+    pluginVersion: config.pluginVersion || "0.2.3",
     capabilities: normalizeCapabilities(
       config.capabilities || DEFAULT_CAPABILITIES,
     ),
