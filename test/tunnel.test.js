@@ -192,6 +192,106 @@ test("manager URLs allow ordinary HTTP and HTTPS without port heuristics", () =>
   assert.throws(() => validateManagerUrl("wss://manager.example"), /http/);
 });
 
+test("outbound scheduler is fair, prioritized, and bounded", async () => {
+  const sent = [];
+  const callbacks = [];
+  const tunnel = new ManagerTunnel({
+    serverUrl: "http://127.0.0.1:1",
+    localOrigin: "http://127.0.0.1:1",
+    maxQueuedOutboundFrames: 16,
+  });
+  tunnel.socket = {
+    readyState: WebSocket.OPEN,
+    send(payload, callback) {
+      const separator = Buffer.from(payload).indexOf(10);
+      sent.push(
+        separator > 0
+          ? JSON.parse(Buffer.from(payload).subarray(0, separator).toString())
+          : JSON.parse(payload),
+      );
+      callbacks.push(callback);
+    },
+    close() {},
+  };
+  const release = async () => {
+    callbacks.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  try {
+    assert.equal(
+      tunnel.sendBinary(
+        { type: "proxy_response_chunk_binary", requestId: "bulk-first" },
+        Buffer.from("first"),
+      ),
+      true,
+    );
+    const pending = [
+      tunnel.sendAsync({
+        type: "proxy_response_chunk_binary",
+        requestId: "bulk-second",
+      }),
+      ...["critical-1", "critical-2", "critical-3", "critical-4"].map(
+        (requestId) =>
+          tunnel.sendAsync({ type: "proxy_response_start", requestId }),
+      ),
+      ...["interactive-1", "interactive-2"].map((requestId) =>
+        tunnel.sendAsync({ type: "proxy_response", requestId }),
+      ),
+    ];
+    for (let index = 0; index < 8; index++) await release();
+    await Promise.all(pending);
+    assert.deepEqual(
+      sent.map((message) => message.requestId),
+      [
+        "bulk-first",
+        "critical-1",
+        "critical-2",
+        "critical-3",
+        "interactive-1",
+        "interactive-2",
+        "bulk-second",
+        "critical-4",
+      ],
+    );
+    assert.equal(tunnel.proxyMetrics.outboundSent, 8);
+    assert.equal(tunnel.proxyMetrics.outboundByPriority.bulk.sent, 2);
+    assert.equal(tunnel.proxyMetrics.outboundQueuedFrames, 0);
+
+    const bounded = new ManagerTunnel({
+      serverUrl: "http://127.0.0.1:1",
+      localOrigin: "http://127.0.0.1:1",
+      maxQueuedOutboundFrames: 1,
+    });
+    bounded.socket = {
+      readyState: WebSocket.OPEN,
+      send() {},
+      close() {},
+    };
+    const active = bounded.sendAsync({
+      type: "proxy_response",
+      requestId: "a",
+    });
+    const queued = bounded.sendAsync({
+      type: "proxy_response_chunk_binary",
+      requestId: "b",
+    });
+    await assert.rejects(
+      bounded.sendAsync({
+        type: "proxy_response_chunk_binary",
+        requestId: "c",
+      }),
+      { code: "PROXY_OUTBOUND_QUEUE_FULL" },
+    );
+    assert.equal(bounded.proxyMetrics.outboundRejected, 1);
+    assert.equal(bounded.proxyMetrics.outboundQueuedFrames, 1);
+    bounded.failOutbound();
+    await assert.rejects(active, { code: "MANAGER_TUNNEL_CLOSED" });
+    await assert.rejects(queued, { code: "MANAGER_TUNNEL_CLOSED" });
+  } finally {
+    tunnel.close();
+  }
+});
+
 test("buffered HTTP proxy response respects configured byte limit", async () => {
   const local = http.createServer((_request, response) => {
     response.writeHead(200, { "Content-Length": "5" });
@@ -233,6 +333,7 @@ test("buffered HTTP proxy response respects configured byte limit", async () => 
 test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the plugin", async () => {
   let bootstrapTokenSeen = false;
   let websocketCookie = "";
+  let streamedUpload = "";
   let slowResponseClosed;
   const slowResponseClosedPromise = new Promise((resolve) => {
     slowResponseClosed = resolve;
@@ -258,6 +359,16 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
         Vary: "Accept-Encoding",
       });
       response.end(body);
+      return;
+    }
+    if (request.url === "/upload") {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        streamedUpload = Buffer.concat(chunks).toString();
+        response.writeHead(201, { "Content-Type": "text/plain" });
+        response.end("uploaded:" + streamedUpload);
+      });
       return;
     }
     if (request.url === "/stream") {
@@ -364,6 +475,10 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
       register.instances[0].startupUrl.includes("token=secret"),
       true,
     );
+    assert.equal(
+      register.capabilities.includes("proxy.http-request-stream-v1"),
+      true,
+    );
 
     socket.send(
       JSON.stringify({
@@ -397,6 +512,68 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
       gunzipSync(Buffer.from(clean.body, "base64")).toString(),
       "bootstrapped",
     );
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "legacy-upload",
+        method: "POST",
+        path: "/upload",
+        headers: { "Content-Type": "text/plain" },
+        body: Buffer.from("legacy").toString("base64"),
+      }),
+    );
+    const legacyUpload = await next(
+      (value) => value.requestId === "legacy-upload",
+    );
+    assert.equal(
+      Buffer.from(legacyUpload.body, "base64").toString(),
+      "uploaded:legacy",
+    );
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request_start",
+        requestId: "upload",
+        method: "POST",
+        path: "/upload",
+        headers: { "Content-Type": "text/plain" },
+        contentLength: 6,
+      }),
+    );
+    socket.send(
+      Buffer.concat([
+        Buffer.from(
+          JSON.stringify({
+            type: "proxy_request_chunk_binary",
+            requestId: "upload",
+          }) + "\n",
+        ),
+        Buffer.from("foo"),
+      ]),
+    );
+    socket.send(
+      Buffer.concat([
+        Buffer.from(
+          JSON.stringify({
+            type: "proxy_request_chunk_binary",
+            requestId: "upload",
+          }) + "\n",
+        ),
+        Buffer.from("bar"),
+      ]),
+    );
+    socket.send(
+      JSON.stringify({ type: "proxy_request_end", requestId: "upload" }),
+    );
+    const upload = await next((value) => value.requestId === "upload");
+    assert.equal(upload.status, 201);
+    assert.equal(
+      Buffer.from(upload.body, "base64").toString(),
+      "uploaded:foobar",
+    );
+    assert.equal(streamedUpload, "foobar");
+    assert.equal(tunnel.proxyMetrics.streamedRequestBytes, 6);
 
     socket.send(
       JSON.stringify({
@@ -440,14 +617,16 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
         value.type === "proxy_response_chunk_binary" &&
         value.requestId === "stream",
     );
-    assert.equal(
-      Buffer.concat([streamChunkA.bodyBytes, streamChunkB.bodyBytes]).length,
-      128 * 1024,
-    );
+    assert.ok(streamChunkA.bodyBytes.length <= 64 * 1024);
+    assert.ok(streamChunkB.bodyBytes.length <= 64 * 1024);
     await next(
       (value) =>
         value.type === "proxy_response_end" && value.requestId === "stream",
     );
+    // node:http can split a 64 KiB write at TCP boundaries. The WebSocket
+    // peer receives end before its send callback settles the local record.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(tunnel.proxyMetrics.streamedBytes, 128 * 1024);
 
     socket.send(
       JSON.stringify({

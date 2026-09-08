@@ -16,6 +16,52 @@ const proxyRequestTimeoutMs = 5 * 60 * 1000;
 const maxStreamChunkBytes = 64 * 1024;
 const defaultMaxProxyRequests = 16;
 const defaultMaxBufferedResponseBytes = 32 * 1024 * 1024;
+const defaultMaxStreamRequestBytes = 32 * 1024 * 1024;
+const defaultMaxStreamRequestChunkBytes = 64 * 1024;
+const defaultMaxBufferedStreamRequestBytes = 1024 * 1024;
+const defaultMaxQueuedOutboundFrames = 256;
+const defaultMaxQueuedOutboundBytes = 8 * 1024 * 1024;
+const outboundPriorities = ["critical", "interactive", "bulk"];
+// Weighted round-robin gives control frames low latency without starving
+// response chunks when a manager is busy.
+const outboundSchedule = [
+  "critical",
+  "critical",
+  "critical",
+  "interactive",
+  "interactive",
+  "bulk",
+];
+function outboundQueueFullError() {
+  const error = new Error("manager outbound frame queue is full");
+  error.code = "PROXY_OUTBOUND_QUEUE_FULL";
+  return error;
+}
+function outboundPriority(value) {
+  const type = value?.type || "";
+  if (
+    type === "proxy_response_start" ||
+    type === "proxy_response_end" ||
+    type === "proxy_ws_open_result" ||
+    type === "proxy_ws_close" ||
+    (type === "proxy_response" && value?.error)
+  )
+    return "critical";
+  if (
+    type === "proxy_response_chunk_binary" ||
+    type === "proxy_ws_frame" ||
+    type === "proxy_ws_frame_binary"
+  )
+    return "bulk";
+  return "interactive";
+}
+function streamedRequestLimitError(limit) {
+  const error = new Error(
+    "manager streamed request exceeds limit of " + limit + " bytes",
+  );
+  error.code = "PROXY_REQUEST_TOO_LARGE";
+  return error;
+}
 function bufferedResponseLimitError(limit) {
   const error = new Error(
     "local dsh response exceeds buffer limit of " + limit + " bytes",
@@ -60,6 +106,42 @@ function acceptsGzip(value) {
       (item) => item.trim().split(";", 1)[0].trim().toLowerCase() === "gzip",
     );
 }
+function bufferHttpResponse(response, record) {
+  return new Promise((resolve, reject) => {
+    const limit = record.maxBufferedResponseBytes;
+    const contentLength = Number(response.headers["content-length"]);
+    response.on("error", reject);
+    if (Number.isFinite(contentLength) && contentLength > limit) {
+      const error = bufferedResponseLimitError(limit);
+      response.destroy(error);
+      reject(error);
+      return;
+    }
+    let byteLength = 0;
+    const chunks = [];
+    response.on("data", (chunk) => {
+      const bytes = Buffer.from(chunk);
+      if (byteLength + bytes.length > limit) {
+        const error = bufferedResponseLimitError(limit);
+        response.destroy(error);
+        reject(error);
+        return;
+      }
+      byteLength += bytes.length;
+      chunks.push(bytes);
+    });
+    response.on("end", () =>
+      resolve({
+        status: response.statusCode || 502,
+        headers: response.headers,
+        body: Buffer.concat(chunks, byteLength),
+      }),
+    );
+    response.on("aborted", () =>
+      reject(new Error("local dsh response aborted")),
+    );
+  });
+}
 function requestRaw(url, method, headers, body, record) {
   return new Promise((resolve, reject) => {
     const secure = url.protocol === "https:";
@@ -71,38 +153,9 @@ function requestRaw(url, method, headers, body, record) {
       method,
       headers,
     };
-    const req = (secure ? https : http).request(options, (res) => {
-      record.response = res;
-      const limit = record.maxBufferedResponseBytes;
-      const contentLength = Number(res.headers["content-length"]);
-      res.on("error", reject);
-      if (Number.isFinite(contentLength) && contentLength > limit) {
-        const error = bufferedResponseLimitError(limit);
-        res.destroy(error);
-        reject(error);
-        return;
-      }
-      let byteLength = 0;
-      const chunks = [];
-      res.on("data", (chunk) => {
-        const bytes = Buffer.from(chunk);
-        if (byteLength + bytes.length > limit) {
-          const error = bufferedResponseLimitError(limit);
-          res.destroy(error);
-          reject(error);
-          return;
-        }
-        byteLength += bytes.length;
-        chunks.push(bytes);
-      });
-      res.on("end", () =>
-        resolve({
-          status: res.statusCode || 502,
-          headers: res.headers,
-          body: Buffer.concat(chunks, byteLength),
-        }),
-      );
-      res.on("aborted", () => reject(new Error("local dsh response aborted")));
+    const req = (secure ? https : http).request(options, (response) => {
+      record.response = response;
+      bufferHttpResponse(response, record).then(resolve, reject);
     });
     record.req = req;
     req.setTimeout(proxyRequestTimeoutMs, () => {
@@ -195,7 +248,55 @@ export class ManagerTunnel {
       cancelMisses: 0,
       streamedBytes: 0,
       peakActive: 0,
+      outboundEnqueued: 0,
+      outboundSent: 0,
+      outboundRejected: 0,
+      outboundFailed: 0,
+      outboundQueuedFrames: 0,
+      outboundQueuedBytes: 0,
+      outboundPeakQueuedFrames: 0,
+      outboundPeakQueuedBytes: 0,
+      streamedRequestBytes: 0,
+      streamedRequestRejected: 0,
+      streamedRequestPeakBufferedBytes: 0,
+      outboundByPriority: Object.fromEntries(
+        outboundPriorities.map((priority) => [
+          priority,
+          { enqueued: 0, sent: 0, rejected: 0 },
+        ]),
+      ),
     };
+    this.maxStreamRequestBytes =
+      Number.isSafeInteger(options.maxStreamRequestBytes) &&
+      options.maxStreamRequestBytes > 0
+        ? options.maxStreamRequestBytes
+        : defaultMaxStreamRequestBytes;
+    this.maxStreamRequestChunkBytes =
+      Number.isSafeInteger(options.maxStreamRequestChunkBytes) &&
+      options.maxStreamRequestChunkBytes > 0
+        ? options.maxStreamRequestChunkBytes
+        : defaultMaxStreamRequestChunkBytes;
+    this.maxBufferedStreamRequestBytes =
+      Number.isSafeInteger(options.maxBufferedStreamRequestBytes) &&
+      options.maxBufferedStreamRequestBytes > 0
+        ? options.maxBufferedStreamRequestBytes
+        : defaultMaxBufferedStreamRequestBytes;
+    this.maxQueuedOutboundFrames =
+      Number.isSafeInteger(options.maxQueuedOutboundFrames) &&
+      options.maxQueuedOutboundFrames > 0
+        ? options.maxQueuedOutboundFrames
+        : defaultMaxQueuedOutboundFrames;
+    this.maxQueuedOutboundBytes =
+      Number.isSafeInteger(options.maxQueuedOutboundBytes) &&
+      options.maxQueuedOutboundBytes > 0
+        ? options.maxQueuedOutboundBytes
+        : defaultMaxQueuedOutboundBytes;
+    this.outboundQueues = Object.fromEntries(
+      outboundPriorities.map((priority) => [priority, []]),
+    );
+    this.outboundCursor = 0;
+    this.outboundSending = false;
+    this.outboundInFlight = null;
     this.reconnectDelay = 1000;
     this.reconnectTimer = null;
     this.keepaliveTimer = null;
@@ -353,6 +454,7 @@ export class ManagerTunnel {
         if (keepaliveTimer) clearInterval(keepaliveTimer);
         if (this.socket === socket) {
           this.socket = null;
+          this.failOutbound(tunnelClosedError());
           if (this.keepaliveTimer === keepaliveTimer)
             this.keepaliveTimer = null;
         }
@@ -408,23 +510,121 @@ export class ManagerTunnel {
     if (this.socket?.readyState === WebSocket.OPEN)
       this.socket.send(JSON.stringify(value));
   }
-  sendAsync(value, body) {
+  enqueueOutbound(payload, priority) {
     if (this.socket?.readyState !== WebSocket.OPEN)
       return Promise.reject(tunnelClosedError());
+    const selected = outboundPriorities.includes(priority)
+      ? priority
+      : "interactive";
+    const bytes = Buffer.byteLength(payload);
+    const metrics = this.proxyMetrics;
+    if (
+      metrics.outboundQueuedFrames >= this.maxQueuedOutboundFrames ||
+      metrics.outboundQueuedBytes + bytes > this.maxQueuedOutboundBytes
+    ) {
+      metrics.outboundRejected++;
+      metrics.outboundByPriority[selected].rejected++;
+      return Promise.reject(outboundQueueFullError());
+    }
+    return new Promise((resolve, reject) => {
+      this.outboundQueues[selected].push({ payload, bytes, resolve, reject });
+      metrics.outboundEnqueued++;
+      metrics.outboundByPriority[selected].enqueued++;
+      metrics.outboundQueuedFrames++;
+      metrics.outboundQueuedBytes += bytes;
+      metrics.outboundPeakQueuedFrames = Math.max(
+        metrics.outboundPeakQueuedFrames,
+        metrics.outboundQueuedFrames,
+      );
+      metrics.outboundPeakQueuedBytes = Math.max(
+        metrics.outboundPeakQueuedBytes,
+        metrics.outboundQueuedBytes,
+      );
+      this.drainOutbound();
+    });
+  }
+  takeOutbound() {
+    for (let offset = 0; offset < outboundSchedule.length; offset++) {
+      const index = (this.outboundCursor + offset) % outboundSchedule.length;
+      const priority = outboundSchedule[index];
+      const queue = this.outboundQueues[priority];
+      if (queue.length === 0) continue;
+      this.outboundCursor = (index + 1) % outboundSchedule.length;
+      const frame = queue.shift();
+      this.proxyMetrics.outboundQueuedFrames--;
+      this.proxyMetrics.outboundQueuedBytes -= frame.bytes;
+      return { priority, frame };
+    }
+    return null;
+  }
+  drainOutbound() {
+    if (this.outboundSending) return;
+    const next = this.takeOutbound();
+    if (!next) return;
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      next.frame.reject(tunnelClosedError());
+      this.failOutbound(tunnelClosedError());
+      return;
+    }
+    this.outboundSending = true;
+    this.outboundInFlight = next.frame;
+    const complete = (error) => {
+      // A close can reject and clear an in-flight callback before ws invokes it.
+      if (this.outboundInFlight !== next.frame) return;
+      this.outboundSending = false;
+      this.outboundInFlight = null;
+      if (error) {
+        this.proxyMetrics.outboundFailed++;
+        next.frame.reject(error);
+      } else {
+        this.proxyMetrics.outboundSent++;
+        this.proxyMetrics.outboundByPriority[next.priority].sent++;
+        next.frame.resolve();
+      }
+      this.drainOutbound();
+    };
+    try {
+      this.socket.send(next.frame.payload, complete);
+    } catch (error) {
+      complete(error);
+    }
+  }
+  failOutbound(error = tunnelClosedError()) {
+    if (this.outboundInFlight) {
+      this.proxyMetrics.outboundFailed++;
+      this.outboundInFlight.reject(error);
+      this.outboundInFlight = null;
+      this.outboundSending = false;
+    }
+    for (const priority of outboundPriorities) {
+      const queue = this.outboundQueues[priority];
+      while (queue.length) {
+        const frame = queue.shift();
+        this.proxyMetrics.outboundQueuedFrames--;
+        this.proxyMetrics.outboundQueuedBytes -= frame.bytes;
+        this.proxyMetrics.outboundFailed++;
+        frame.reject(error);
+      }
+    }
+  }
+  sendAsync(value, body, priority = outboundPriority(value)) {
     const payload =
       body === undefined ? JSON.stringify(value) : binaryEnvelope(value, body);
-    return new Promise((resolve, reject) =>
-      this.socket.send(payload, (error) => (error ? reject(error) : resolve())),
-    );
+    return this.enqueueOutbound(payload, priority);
   }
-  sendBinary(value, body) {
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    this.socket.send(
-      binaryEnvelope(
-        { ...value, type: value.type || "proxy_response_binary" },
-        body,
+  sendBinary(value, body, priority = outboundPriority(value)) {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    const payload = binaryEnvelope(
+      { ...value, type: value.type || "proxy_response_binary" },
+      body,
+    );
+    this.enqueueOutbound(payload, priority).catch((error) =>
+      console.warn(
+        "[dsh-manager-plugin] outbound frame dropped:",
+        error.message,
       ),
     );
+    return true;
   }
   async handleMessage(raw, isBinary = false) {
     const message = isBinary
@@ -447,6 +647,12 @@ export class ManagerTunnel {
       });
     if (message.type === "proxy_cancel") return this.cancelHttp(message);
     if (message.type === "proxy_request") return this.proxyHttp(message);
+    if (message.type === "proxy_request_start")
+      return this.proxyHttpRequestStart(message);
+    if (message.type === "proxy_request_chunk_binary")
+      return this.proxyHttpRequestChunk(message, message.bodyBytes);
+    if (message.type === "proxy_request_end")
+      return this.proxyHttpRequestEnd(message);
     if (message.type === "proxy_ws_open") return this.openWebSocket(message);
     if (message.type === "proxy_ws_frame")
       return this.forwardWebSocketFrame(message);
@@ -497,6 +703,8 @@ export class ManagerTunnel {
       response: null,
       startedAt: Date.now(),
       streaming: message.streamResponse === true,
+      requestStreaming: false,
+      upload: null,
       cancelled: false,
       responseStarted: false,
       responseEnded: false,
@@ -547,6 +755,8 @@ export class ManagerTunnel {
     const error = Object.assign(new Error("manager cancelled proxy request"), {
       code: "PROXY_CANCELLED",
     });
+    record.upload?.pending.splice(0);
+    if (record.upload) record.upload.pendingBytes = 0;
     record.req?.destroy(error);
     record.response?.destroy(error);
   }
@@ -637,6 +847,264 @@ export class ManagerTunnel {
       if (body.length > 0) req.write(body);
       req.end();
     });
+  }
+  sendBufferedHttpResponse(message, response) {
+    const bytes = response.body;
+    const headers = {};
+    const setCookies = Array.isArray(response.headers["set-cookie"])
+      ? response.headers["set-cookie"]
+      : [];
+    for (const [key, value] of Object.entries(response.headers)) {
+      if (
+        value === undefined ||
+        [
+          "connection",
+          "transfer-encoding",
+          "content-length",
+          "set-cookie",
+        ].includes(key.toLowerCase())
+      )
+        continue;
+      headers[key] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    const metadata = {
+      type: "proxy_response",
+      requestId: message.requestId,
+      status: response.status,
+      headers,
+      setCookies,
+    };
+    if (message.binaryResponse === true)
+      this.sendBinary({ ...metadata, type: "proxy_response_binary" }, bytes);
+    else this.send({ ...metadata, body: bytes.toString("base64") });
+  }
+  failHttpProxy(message, record, error) {
+    if (record.cancelled) return;
+    console.error(
+      "[dsh-manager-plugin] proxy request failed:",
+      message.method || "GET",
+      message.path,
+      error.message,
+    );
+    if (record.streaming) {
+      if (!record.responseStarted)
+        this.send({
+          type: "proxy_response_start",
+          requestId: message.requestId,
+          status: 502,
+          error: error.message,
+        });
+      if (!record.responseEnded)
+        this.send({
+          type: "proxy_response_end",
+          requestId: message.requestId,
+          error: error.message,
+        });
+    } else {
+      this.send({
+        type: "proxy_response",
+        requestId: message.requestId,
+        status: 502,
+        error: error.message,
+      });
+    }
+  }
+  rejectStreamedRequest(record, error) {
+    if (record.cancelled || record.upload?.rejected) return;
+    record.upload.rejected = true;
+    record.upload.pending = [];
+    record.upload.pendingBytes = 0;
+    this.proxyMetrics.streamedRequestRejected++;
+    record.req?.destroy(error);
+    record.response?.destroy(error);
+  }
+  flushStreamedRequest(record) {
+    const upload = record.upload;
+    if (!upload || upload.rejected || record.cancelled || upload.backpressured)
+      return;
+    while (upload.pending.length && !upload.backpressured) {
+      const chunk = upload.pending.shift();
+      upload.pendingBytes -= chunk.length;
+      upload.backpressured = !record.req.write(chunk);
+    }
+    if (upload.ended && upload.pending.length === 0 && !upload.backpressured)
+      record.req.end();
+  }
+  proxyHttpRequestChunk(message, bodyBytes) {
+    const record = this.activeHttpRequests.get(message.requestId);
+    const upload = record?.upload;
+    if (
+      !record?.requestStreaming ||
+      !upload ||
+      upload.ended ||
+      upload.rejected
+    ) {
+      this.proxyMetrics.rejected++;
+      return;
+    }
+    if (!bodyBytes) {
+      this.rejectStreamedRequest(
+        record,
+        new Error("streamed request chunk must use a binary envelope"),
+      );
+      return;
+    }
+    const chunk = Buffer.from(bodyBytes);
+    if (chunk.length > this.maxStreamRequestChunkBytes) {
+      this.rejectStreamedRequest(
+        record,
+        streamedRequestLimitError(this.maxStreamRequestChunkBytes),
+      );
+      return;
+    }
+    if (upload.bytes + chunk.length > this.maxStreamRequestBytes) {
+      this.rejectStreamedRequest(
+        record,
+        streamedRequestLimitError(this.maxStreamRequestBytes),
+      );
+      return;
+    }
+    upload.bytes += chunk.length;
+    this.proxyMetrics.streamedRequestBytes += chunk.length;
+    if (upload.backpressured) {
+      if (
+        upload.pendingBytes + chunk.length >
+        this.maxBufferedStreamRequestBytes
+      ) {
+        this.rejectStreamedRequest(
+          record,
+          streamedRequestLimitError(this.maxBufferedStreamRequestBytes),
+        );
+        return;
+      }
+      upload.pending.push(chunk);
+      upload.pendingBytes += chunk.length;
+      this.proxyMetrics.streamedRequestPeakBufferedBytes = Math.max(
+        this.proxyMetrics.streamedRequestPeakBufferedBytes,
+        upload.pendingBytes,
+      );
+      return;
+    }
+    upload.backpressured = !record.req.write(chunk);
+  }
+  proxyHttpRequestEnd(message) {
+    const record = this.activeHttpRequests.get(message.requestId);
+    const upload = record?.upload;
+    if (
+      !record?.requestStreaming ||
+      !upload ||
+      upload.ended ||
+      upload.rejected
+    ) {
+      this.proxyMetrics.rejected++;
+      return;
+    }
+    if (
+      Number.isSafeInteger(upload.contentLength) &&
+      upload.bytes !== upload.contentLength
+    ) {
+      this.rejectStreamedRequest(
+        record,
+        new Error(
+          "streamed request content length does not match received bytes",
+        ),
+      );
+      return;
+    }
+    upload.ended = true;
+    this.flushStreamedRequest(record);
+  }
+  async proxyHttpRequestStart(message) {
+    const record = this.beginHttpRequest(message);
+    if (!record) return;
+    record.requestStreaming = true;
+    record.upload = {
+      bytes: 0,
+      pending: [],
+      pendingBytes: 0,
+      backpressured: false,
+      ended: false,
+      rejected: false,
+      contentLength: null,
+    };
+    let outcome = "completed";
+    let failure;
+    try {
+      const bootstrap =
+        message.bootstrap === true &&
+        (message.method || "GET") === "GET" &&
+        message.path === "/" &&
+        typeof this.options.startupUrl === "string";
+      const target = bootstrap
+        ? new URL(this.options.startupUrl)
+        : this.localUrl(message.path);
+      const headers = { ...(message.headers || {}) };
+      deleteHeader(headers, "host");
+      deleteHeader(headers, "connection");
+      deleteHeader(headers, "upgrade");
+      deleteHeader(headers, "content-length");
+      deleteHeader(headers, "transfer-encoding");
+      deleteHeader(headers, "content-encoding");
+      deleteHeader(headers, "X-Dsh-Manager-Bootstrap");
+      deleteHeader(headers, "X-Dsh-Manager-Session");
+      const acceptedEncoding = headerValue(message.headers, "accept-encoding");
+      deleteHeader(headers, "accept-encoding");
+      headers["accept-encoding"] = acceptsGzip(acceptedEncoding)
+        ? "gzip"
+        : "identity";
+      const localOrigin = this.options.localOrigin.replace(/\/$/, "");
+      for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase();
+        if (lower === "origin") headers[key] = localOrigin;
+        else if (lower === "referer") headers[key] = localOrigin + "/";
+      }
+      const contentLength = Number(message.contentLength);
+      if (Number.isSafeInteger(contentLength) && contentLength >= 0) {
+        if (contentLength > this.maxStreamRequestBytes)
+          throw streamedRequestLimitError(this.maxStreamRequestBytes);
+        headers["content-length"] = String(contentLength);
+        record.upload.contentLength = contentLength;
+      }
+      await new Promise((resolve, reject) => {
+        const secure = target.protocol === "https:";
+        const req = (secure ? https : http).request(
+          {
+            protocol: target.protocol,
+            hostname: target.hostname,
+            port: target.port || (secure ? 443 : 80),
+            path: target.pathname + target.search,
+            method: message.method || "GET",
+            headers,
+          },
+          (response) => {
+            record.response = response;
+            const complete = record.streaming
+              ? this.streamHttpResponse(message, response, record)
+              : bufferHttpResponse(response, record).then((buffered) =>
+                  this.sendBufferedHttpResponse(message, buffered),
+                );
+            complete.then(resolve, reject);
+          },
+        );
+        record.req = req;
+        req.setTimeout(proxyRequestTimeoutMs, () =>
+          req.destroy(new Error("local streamed dsh request timed out")),
+        );
+        req.on("error", reject);
+        req.on("drain", () => {
+          if (!record.upload || record.cancelled) return;
+          record.upload.backpressured = false;
+          this.flushStreamedRequest(record);
+        });
+      });
+    } catch (error) {
+      failure = error;
+      outcome = record.cancelled ? "cancelled" : "failed";
+      this.failHttpProxy(message, record, error);
+    } finally {
+      if (record.cancelled) outcome = "cancelled";
+      this.finishHttpRequest(record, outcome, failure);
+    }
   }
   async proxyHttp(message) {
     const record = this.beginHttpRequest(message);
@@ -861,6 +1329,7 @@ export class ManagerTunnel {
   }
   close() {
     this.closed = true;
+    this.failOutbound(tunnelClosedError());
     for (const socket of this.sockets.values()) socket.close();
     this.sockets.clear();
     for (const record of this.activeHttpRequests.values()) {

@@ -6,6 +6,7 @@ export const DEFAULT_CAPABILITIES = [
   "dsh.web.bootstrap-v1",
   "proxy.binary-response-v1",
   "proxy.http-stream-v1",
+  "proxy.http-request-stream-v1",
   "proxy.binary-websocket-frame-v1",
   "proxy.cancel-v1",
 ];
