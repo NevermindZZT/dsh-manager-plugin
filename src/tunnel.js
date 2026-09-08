@@ -13,6 +13,35 @@ function tunnelClosedError() {
   return error;
 }
 const proxyRequestTimeoutMs = 5 * 60 * 1000;
+const maxStreamChunkBytes = 64 * 1024;
+const defaultMaxProxyRequests = 16;
+const defaultMaxBufferedResponseBytes = 32 * 1024 * 1024;
+function bufferedResponseLimitError(limit) {
+  const error = new Error(
+    "local dsh response exceeds buffer limit of " + limit + " bytes",
+  );
+  error.code = "PROXY_RESPONSE_TOO_LARGE";
+  return error;
+}
+function binaryEnvelope(value, body) {
+  return Buffer.concat([
+    Buffer.from(JSON.stringify(value) + "\n", "utf8"),
+    Buffer.from(body),
+  ]);
+}
+function parseBinaryEnvelope(raw) {
+  const data = Buffer.from(raw);
+  const separator = data.indexOf(10);
+  if (separator <= 0) return null;
+  try {
+    return {
+      ...JSON.parse(data.subarray(0, separator).toString("utf8")),
+      bodyBytes: data.subarray(separator + 1),
+    };
+  } catch {
+    return null;
+  }
+}
 function deleteHeader(headers, name) {
   for (const key of Object.keys(headers)) {
     if (key.toLowerCase() === name.toLowerCase()) delete headers[key];
@@ -31,7 +60,7 @@ function acceptsGzip(value) {
       (item) => item.trim().split(";", 1)[0].trim().toLowerCase() === "gzip",
     );
 }
-function requestRaw(url, method, headers, body) {
+function requestRaw(url, method, headers, body, record) {
   return new Promise((resolve, reject) => {
     const secure = url.protocol === "https:";
     const options = {
@@ -43,17 +72,39 @@ function requestRaw(url, method, headers, body) {
       headers,
     };
     const req = (secure ? https : http).request(options, (res) => {
+      record.response = res;
+      const limit = record.maxBufferedResponseBytes;
+      const contentLength = Number(res.headers["content-length"]);
+      res.on("error", reject);
+      if (Number.isFinite(contentLength) && contentLength > limit) {
+        const error = bufferedResponseLimitError(limit);
+        res.destroy(error);
+        reject(error);
+        return;
+      }
+      let byteLength = 0;
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk);
+        if (byteLength + bytes.length > limit) {
+          const error = bufferedResponseLimitError(limit);
+          res.destroy(error);
+          reject(error);
+          return;
+        }
+        byteLength += bytes.length;
+        chunks.push(bytes);
+      });
       res.on("end", () =>
         resolve({
           status: res.statusCode || 502,
           headers: res.headers,
-          body: Buffer.concat(chunks),
+          body: Buffer.concat(chunks, byteLength),
         }),
       );
       res.on("aborted", () => reject(new Error("local dsh response aborted")));
     });
+    record.req = req;
     req.setTimeout(proxyRequestTimeoutMs, () => {
       req.destroy(new Error("local dsh request timed out"));
     });
@@ -124,6 +175,27 @@ export class ManagerTunnel {
     this.socket = null;
     this.closed = false;
     this.sockets = new Map();
+    this.activeHttpRequests = new Map();
+    this.maxProxyRequests =
+      Number.isSafeInteger(options.maxProxyRequests) &&
+      options.maxProxyRequests > 0
+        ? options.maxProxyRequests
+        : defaultMaxProxyRequests;
+    this.maxBufferedResponseBytes =
+      Number.isSafeInteger(options.maxBufferedResponseBytes) &&
+      options.maxBufferedResponseBytes > 0
+        ? options.maxBufferedResponseBytes
+        : defaultMaxBufferedResponseBytes;
+    this.proxyMetrics = {
+      started: 0,
+      completed: 0,
+      cancelled: 0,
+      failed: 0,
+      rejected: 0,
+      cancelMisses: 0,
+      streamedBytes: 0,
+      peakActive: 0,
+    };
     this.reconnectDelay = 1000;
     this.reconnectTimer = null;
     this.keepaliveTimer = null;
@@ -252,7 +324,9 @@ export class ManagerTunnel {
         });
         settleResolve();
       });
-      socket.on("message", (data) => this.handleMessage(data));
+      socket.on("message", (data, isBinary) =>
+        this.handleMessage(data, isBinary),
+      );
       socket.once("unexpected-response", (_request, response) => {
         const error = new Error(
           "manager WebSocket rejected: HTTP " + response.statusCode,
@@ -334,21 +408,35 @@ export class ManagerTunnel {
     if (this.socket?.readyState === WebSocket.OPEN)
       this.socket.send(JSON.stringify(value));
   }
+  sendAsync(value, body) {
+    if (this.socket?.readyState !== WebSocket.OPEN)
+      return Promise.reject(tunnelClosedError());
+    const payload =
+      body === undefined ? JSON.stringify(value) : binaryEnvelope(value, body);
+    return new Promise((resolve, reject) =>
+      this.socket.send(payload, (error) => (error ? reject(error) : resolve())),
+    );
+  }
   sendBinary(value, body) {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
-    const header = Buffer.from(
-      JSON.stringify({ ...value, type: "proxy_response_binary" }) + "\n",
-      "utf8",
+    this.socket.send(
+      binaryEnvelope(
+        { ...value, type: value.type || "proxy_response_binary" },
+        body,
+      ),
     );
-    this.socket.send(Buffer.concat([header, body]));
   }
-  async handleMessage(raw) {
-    let message;
-    try {
-      message = JSON.parse(raw.toString("utf8"));
-    } catch {
-      return;
-    }
+  async handleMessage(raw, isBinary = false) {
+    const message = isBinary
+      ? parseBinaryEnvelope(raw)
+      : (() => {
+          try {
+            return JSON.parse(raw.toString("utf8"));
+          } catch {
+            return null;
+          }
+        })();
+    if (!message) return;
     if (message.type === "command")
       return this.send({
         type: "command_result",
@@ -357,10 +445,13 @@ export class ManagerTunnel {
         ok: false,
         error: "dsh-plugin does not support lifecycle commands",
       });
+    if (message.type === "proxy_cancel") return this.cancelHttp(message);
     if (message.type === "proxy_request") return this.proxyHttp(message);
     if (message.type === "proxy_ws_open") return this.openWebSocket(message);
     if (message.type === "proxy_ws_frame")
       return this.forwardWebSocketFrame(message);
+    if (message.type === "proxy_ws_frame_binary")
+      return this.forwardWebSocketFrame(message, message.bodyBytes);
     if (message.type === "proxy_ws_close") return this.closeWebSocket(message);
   }
   localUrl(path) {
@@ -371,7 +462,187 @@ export class ManagerTunnel {
         : this.options.localOrigin + "/",
     );
   }
+  beginHttpRequest(message) {
+    const requestId = message.requestId;
+    if (!requestId || this.activeHttpRequests.has(requestId)) {
+      this.proxyMetrics.rejected++;
+      console.warn("[dsh-manager-plugin] proxy request rejected:", requestId);
+      this.send({
+        type: "proxy_response",
+        requestId,
+        status: 409,
+        error: "duplicate or missing proxy request id",
+      });
+      return null;
+    }
+    if (this.activeHttpRequests.size >= this.maxProxyRequests) {
+      this.proxyMetrics.rejected++;
+      console.warn(
+        "[dsh-manager-plugin] proxy concurrency limit:",
+        requestId,
+        "active=" + this.activeHttpRequests.size,
+        "limit=" + this.maxProxyRequests,
+      );
+      this.send({
+        type: "proxy_response",
+        requestId,
+        status: 503,
+        error: "proxy concurrency limit exceeded",
+      });
+      return null;
+    }
+    const record = {
+      requestId,
+      req: null,
+      response: null,
+      startedAt: Date.now(),
+      streaming: message.streamResponse === true,
+      cancelled: false,
+      responseStarted: false,
+      responseEnded: false,
+      bytes: 0,
+      maxBufferedResponseBytes: this.maxBufferedResponseBytes,
+      settled: false,
+    };
+    this.activeHttpRequests.set(requestId, record);
+    this.proxyMetrics.started++;
+    this.proxyMetrics.peakActive = Math.max(
+      this.proxyMetrics.peakActive,
+      this.activeHttpRequests.size,
+    );
+    return record;
+  }
+  finishHttpRequest(record, outcome, error) {
+    if (record.settled) return;
+    record.settled = true;
+    if (this.activeHttpRequests.get(record.requestId) === record)
+      this.activeHttpRequests.delete(record.requestId);
+    if (outcome === "cancelled") this.proxyMetrics.cancelled++;
+    else if (outcome === "failed") this.proxyMetrics.failed++;
+    else this.proxyMetrics.completed++;
+    this.proxyMetrics.streamedBytes += record.bytes;
+    console.info(
+      "[dsh-manager-plugin] proxy complete:",
+      record.requestId,
+      "outcome=" + outcome,
+      "stream=" + record.streaming,
+      "bytes=" + record.bytes,
+      "elapsedMs=" + (Date.now() - record.startedAt),
+      "active=" + this.activeHttpRequests.size,
+      error ? "error=" + error.message : "",
+    );
+  }
+  cancelHttp(message) {
+    const record = this.activeHttpRequests.get(message.requestId);
+    if (!record) {
+      this.proxyMetrics.cancelMisses++;
+      console.info(
+        "[dsh-manager-plugin] proxy cancel miss:",
+        message.requestId,
+      );
+      return;
+    }
+    if (record.cancelled) return;
+    record.cancelled = true;
+    const error = Object.assign(new Error("manager cancelled proxy request"), {
+      code: "PROXY_CANCELLED",
+    });
+    record.req?.destroy(error);
+    record.response?.destroy(error);
+  }
+  responseMetadata(message, response, type) {
+    const headers = {};
+    const setCookies = Array.isArray(response.headers["set-cookie"])
+      ? response.headers["set-cookie"]
+      : [];
+    for (const [key, value] of Object.entries(response.headers)) {
+      if (
+        value === undefined ||
+        [
+          "connection",
+          "transfer-encoding",
+          "content-length",
+          "set-cookie",
+        ].includes(key.toLowerCase())
+      )
+        continue;
+      headers[key] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    return {
+      type,
+      requestId: message.requestId,
+      status: response.statusCode || 502,
+      headers,
+      setCookies,
+    };
+  }
+  async streamHttpResponse(message, response, record) {
+    await this.sendAsync(
+      this.responseMetadata(message, response, "proxy_response_start"),
+    );
+    record.responseStarted = true;
+    for await (const chunk of response) {
+      if (record.cancelled) break;
+      const bytes = Buffer.from(chunk);
+      for (
+        let offset = 0;
+        offset < bytes.length;
+        offset += maxStreamChunkBytes
+      ) {
+        if (record.cancelled) break;
+        const body = bytes.subarray(offset, offset + maxStreamChunkBytes);
+        await this.sendAsync(
+          {
+            type: "proxy_response_chunk_binary",
+            requestId: message.requestId,
+          },
+          body,
+        );
+        record.bytes += body.length;
+      }
+    }
+    if (!record.cancelled) {
+      await this.sendAsync({
+        type: "proxy_response_end",
+        requestId: message.requestId,
+      });
+      record.responseEnded = true;
+    }
+  }
+  proxyHttpStream(target, method, headers, body, message, record) {
+    return new Promise((resolve, reject) => {
+      const secure = target.protocol === "https:";
+      const req = (secure ? https : http).request(
+        {
+          protocol: target.protocol,
+          hostname: target.hostname,
+          port: target.port || (secure ? 443 : 80),
+          path: target.pathname + target.search,
+          method,
+          headers,
+        },
+        (response) => {
+          record.response = response;
+          this.streamHttpResponse(message, response, record).then(
+            resolve,
+            reject,
+          );
+        },
+      );
+      record.req = req;
+      req.setTimeout(proxyRequestTimeoutMs, () =>
+        req.destroy(new Error("local streamed dsh request timed out")),
+      );
+      req.on("error", reject);
+      if (body.length > 0) req.write(body);
+      req.end();
+    });
+  }
   async proxyHttp(message) {
+    const record = this.beginHttpRequest(message);
+    if (!record) return;
+    let outcome = "completed";
+    let failure;
     try {
       const bootstrap =
         message.bootstrap === true &&
@@ -412,11 +683,23 @@ export class ManagerTunnel {
         ? Buffer.from(message.body, "base64")
         : Buffer.alloc(0);
       if (body.length > 0) headers["content-length"] = String(body.length);
+      if (message.streamResponse === true) {
+        await this.proxyHttpStream(
+          target,
+          message.method || "GET",
+          headers,
+          body,
+          message,
+          record,
+        );
+        return;
+      }
       const response = await requestRaw(
         target,
         message.method || "GET",
         headers,
         body,
+        record,
       );
       const bytes = response.body;
       const resultHeaders = {};
@@ -453,7 +736,7 @@ export class ManagerTunnel {
         setCookies,
       };
       if (message.binaryResponse === true) {
-        this.sendBinary(metadata, bytes);
+        this.sendBinary({ ...metadata, type: "proxy_response_binary" }, bytes);
       } else {
         this.send({
           ...metadata,
@@ -461,18 +744,41 @@ export class ManagerTunnel {
         });
       }
     } catch (error) {
-      console.error(
-        "[dsh-manager-plugin] proxy request failed:",
-        message.method || "GET",
-        message.path,
-        error.message,
-      );
-      this.send({
-        type: "proxy_response",
-        requestId: message.requestId,
-        status: 502,
-        error: error.message,
-      });
+      failure = error;
+      outcome = record.cancelled ? "cancelled" : "failed";
+      if (!record.cancelled) {
+        console.error(
+          "[dsh-manager-plugin] proxy request failed:",
+          message.method || "GET",
+          message.path,
+          error.message,
+        );
+        if (record.streaming) {
+          if (!record.responseStarted)
+            this.send({
+              type: "proxy_response_start",
+              requestId: message.requestId,
+              status: 502,
+              error: error.message,
+            });
+          if (!record.responseEnded)
+            this.send({
+              type: "proxy_response_end",
+              requestId: message.requestId,
+              error: error.message,
+            });
+        } else {
+          this.send({
+            type: "proxy_response",
+            requestId: message.requestId,
+            status: 502,
+            error: error.message,
+          });
+        }
+      }
+    } finally {
+      if (record.cancelled) outcome = "cancelled";
+      this.finishHttpRequest(record, outcome, failure);
     }
   }
   openWebSocket(message) {
@@ -496,14 +802,25 @@ export class ManagerTunnel {
           ok: true,
         }),
       );
-      socket.on("message", (data, isBinary) =>
-        this.send({
-          type: "proxy_ws_frame",
-          requestId: message.requestId,
-          frameType: isBinary ? "binary" : "text",
-          body: Buffer.from(data).toString("base64"),
-        }),
-      );
+      socket.on("message", (data, isBinary) => {
+        const body = Buffer.from(data);
+        if (message.binaryFrames === true)
+          this.sendBinary(
+            {
+              type: "proxy_ws_frame_binary",
+              requestId: message.requestId,
+              frameType: isBinary ? "binary" : "text",
+            },
+            body,
+          );
+        else
+          this.send({
+            type: "proxy_ws_frame",
+            requestId: message.requestId,
+            frameType: isBinary ? "binary" : "text",
+            body: body.toString("base64"),
+          });
+      });
       socket.on("error", (error) =>
         this.send({
           type: "proxy_ws_close",
@@ -528,10 +845,10 @@ export class ManagerTunnel {
       });
     }
   }
-  forwardWebSocketFrame(message) {
+  forwardWebSocketFrame(message, bodyBytes) {
     const socket = this.sockets.get(message.requestId);
     if (socket)
-      socket.send(Buffer.from(message.body || "", "base64"), {
+      socket.send(bodyBytes || Buffer.from(message.body || "", "base64"), {
         binary: message.frameType === "binary",
       });
   }
@@ -546,6 +863,15 @@ export class ManagerTunnel {
     this.closed = true;
     for (const socket of this.sockets.values()) socket.close();
     this.sockets.clear();
+    for (const record of this.activeHttpRequests.values()) {
+      record.cancelled = true;
+      const error = Object.assign(new Error("manager tunnel closed"), {
+        code: "MANAGER_TUNNEL_CLOSED",
+      });
+      record.req?.destroy(error);
+      record.response?.destroy(error);
+    }
+    this.activeHttpRequests.clear();
     const rejectConnect = this.pendingConnectReject;
     this.pendingConnectReject = null;
     rejectConnect?.(tunnelClosedError());

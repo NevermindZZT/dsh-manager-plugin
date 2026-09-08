@@ -192,9 +192,51 @@ test("manager URLs allow ordinary HTTP and HTTPS without port heuristics", () =>
   assert.throws(() => validateManagerUrl("wss://manager.example"), /http/);
 });
 
+test("buffered HTTP proxy response respects configured byte limit", async () => {
+  const local = http.createServer((_request, response) => {
+    response.writeHead(200, { "Content-Length": "5" });
+    response.end("hello");
+  });
+  const localPort = await listen(local);
+  const tunnel = new ManagerTunnel({
+    serverUrl: "http://127.0.0.1:1",
+    localOrigin: "http://127.0.0.1:" + localPort,
+    maxBufferedResponseBytes: 4,
+  });
+  const messages = [];
+  tunnel.socket = {
+    readyState: WebSocket.OPEN,
+    send(payload) {
+      messages.push(JSON.parse(payload));
+    },
+    close() {},
+  };
+  try {
+    await tunnel.proxyHttp({
+      type: "proxy_request",
+      requestId: "too-large",
+      method: "GET",
+      path: "/",
+      headers: {},
+    });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].status, 502);
+    assert.match(messages[0].error, /exceeds buffer limit/);
+    assert.equal(tunnel.activeHttpRequests.size, 0);
+    assert.equal(tunnel.proxyMetrics.failed, 1);
+  } finally {
+    tunnel.close();
+    await closeServer(local);
+  }
+});
+
 test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the plugin", async () => {
   let bootstrapTokenSeen = false;
   let websocketCookie = "";
+  let slowResponseClosed;
+  const slowResponseClosedPromise = new Promise((resolve) => {
+    slowResponseClosed = resolve;
+  });
   const local = http.createServer((request, response) => {
     if (request.url === "/?token=secret") {
       bootstrapTokenSeen = true;
@@ -216,6 +258,19 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
         Vary: "Accept-Encoding",
       });
       response.end(body);
+      return;
+    }
+    if (request.url === "/stream") {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.end(Buffer.alloc(128 * 1024, 7));
+      return;
+    }
+    if (request.url === "/slow") {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.write("first");
+      response.once("close", slowResponseClosed);
+      const timer = setTimeout(() => response.end("late"), 5000);
+      timer.unref();
       return;
     }
     if (request.url === "/assets/test.js") {
@@ -243,6 +298,9 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
     websocketCookie = request.headers.cookie;
     localWss.handleUpgrade(request, socket, head, (websocket) => {
       localWss.emit("connection", websocket);
+      websocket.on("message", (data, isBinary) => {
+        if (isBinary) websocket.send(data, { binary: true });
+      });
       websocket.send("pong");
     });
   });
@@ -295,6 +353,7 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
     startupUrl: `http://127.0.0.1:${localPort}/?token=secret`,
     name: "e2e-plugin",
     instanceId: "default",
+    maxProxyRequests: 1,
   });
   try {
     await tunnel.start();
@@ -358,10 +417,87 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
 
     socket.send(
       JSON.stringify({
+        type: "proxy_request",
+        requestId: "stream",
+        method: "GET",
+        path: "/stream",
+        headers: {},
+        streamResponse: true,
+      }),
+    );
+    const streamStart = await next(
+      (value) =>
+        value.type === "proxy_response_start" && value.requestId === "stream",
+    );
+    assert.equal(streamStart.status, 200);
+    const streamChunkA = await nextBinaryManagerMessage(
+      (value) =>
+        value.type === "proxy_response_chunk_binary" &&
+        value.requestId === "stream",
+    );
+    const streamChunkB = await nextBinaryManagerMessage(
+      (value) =>
+        value.type === "proxy_response_chunk_binary" &&
+        value.requestId === "stream",
+    );
+    assert.equal(
+      Buffer.concat([streamChunkA.bodyBytes, streamChunkB.bodyBytes]).length,
+      128 * 1024,
+    );
+    await next(
+      (value) =>
+        value.type === "proxy_response_end" && value.requestId === "stream",
+    );
+
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "cancel-stream",
+        method: "GET",
+        path: "/slow",
+        headers: {},
+        streamResponse: true,
+      }),
+    );
+    await next(
+      (value) =>
+        value.type === "proxy_response_start" &&
+        value.requestId === "cancel-stream",
+    );
+    await nextBinaryManagerMessage(
+      (value) =>
+        value.type === "proxy_response_chunk_binary" &&
+        value.requestId === "cancel-stream",
+    );
+    socket.send(
+      JSON.stringify({
+        type: "proxy_request",
+        requestId: "concurrency-rejected",
+        method: "GET",
+        path: "/",
+        headers: {},
+      }),
+    );
+    const rejected = await next(
+      (value) => value.requestId === "concurrency-rejected",
+    );
+    assert.equal(rejected.status, 503);
+    socket.send(
+      JSON.stringify({ type: "proxy_cancel", requestId: "cancel-stream" }),
+    );
+    await slowResponseClosedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(tunnel.activeHttpRequests.size, 0);
+    assert.equal(tunnel.proxyMetrics.cancelled, 1);
+    assert.equal(tunnel.proxyMetrics.rejected, 1);
+
+    socket.send(
+      JSON.stringify({
         type: "proxy_ws_open",
         requestId: "ws",
         path: "/api/remote.mux",
         headers: { Cookie: "dsh-auth-test=ok" },
+        binaryFrames: true,
       }),
     );
     const opened = await next(
@@ -369,11 +505,30 @@ test("DSH startup bootstrap and authenticated WebSocket Cookie pass through the 
         value.requestId === "ws" && value.type === "proxy_ws_open_result",
     );
     assert.equal(opened.ok, true);
-    const frame = await next(
-      (value) => value.requestId === "ws" && value.type === "proxy_ws_frame",
+    const frame = await nextBinaryManagerMessage(
+      (value) =>
+        value.requestId === "ws" && value.type === "proxy_ws_frame_binary",
     );
-    assert.equal(Buffer.from(frame.body, "base64").toString(), "pong");
+    assert.equal(frame.bodyBytes.toString(), "pong");
     assert.equal(websocketCookie, "dsh-auth-test=ok");
+    socket.send(
+      Buffer.concat([
+        Buffer.from(
+          JSON.stringify({
+            type: "proxy_ws_frame_binary",
+            requestId: "ws",
+            frameType: "binary",
+          }) + "\n",
+        ),
+        Buffer.from("ping"),
+      ]),
+    );
+    const echoed = await nextBinaryManagerMessage(
+      (value) =>
+        value.requestId === "ws" && value.type === "proxy_ws_frame_binary",
+    );
+    assert.equal(echoed.frameType, "binary");
+    assert.equal(echoed.bodyBytes.toString(), "ping");
     socket.send(JSON.stringify({ type: "proxy_ws_close", requestId: "ws" }));
   } finally {
     tunnel.close();

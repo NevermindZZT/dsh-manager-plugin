@@ -5,6 +5,9 @@ export const DEFAULT_CAPABILITIES = [
   "plugin.config",
   "dsh.web.bootstrap-v1",
   "proxy.binary-response-v1",
+  "proxy.http-stream-v1",
+  "proxy.binary-websocket-frame-v1",
+  "proxy.cancel-v1",
 ];
 export function normalizeCapabilities(values) {
   const seen = new Set();
