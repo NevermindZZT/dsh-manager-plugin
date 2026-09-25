@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-manager Remote Access",
+    "description": "Secure reverse tunnel and Agent registration for DeepSeek Harness."
+  }
+}

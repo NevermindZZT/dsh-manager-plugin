@@ -2,6 +2,7 @@
   "name": "@nevermindzzt/dsh-manager-plugin",
   "version": "0.2.3",
   "description": "Direct dsh-manager reverse tunnel plugin for DeepSeek Harness",
+  "icon": "./icon.svg",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -15,11 +16,14 @@
     ".": "./src/index.js",
     "./protocol": "./src/protocol.js",
     "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "src",
     "lib",
+    "icon.svg",
+    "locale",
     "README.md",
     "LICENSE",
     "dsh.patch.yml",

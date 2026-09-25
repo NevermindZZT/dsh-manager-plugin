@@ -260,7 +260,23 @@ test("SettingsForms listener accepts the scoped profile entry ID", () => {
   assert.equal(updates.length, 2);
 });
 
-test("RC2 ConfigForms client resolves scoped entry namespace and renders settings", () => {
+test("RC2 package branding and ConfigForms client resolve scoped namespace", () => {
+  assert.equal(pkg.icon, "./icon.svg");
+  assert.equal(pkg.exports["./locale/*.json"], "./locale/*.json");
+  assert.ok(pkg.files.includes("icon.svg"));
+  assert.ok(pkg.files.includes("locale"));
+  const icon = fs.readFileSync(path.join(packageRoot, "icon.svg"), "utf8");
+  assert.match(icon, /^<svg\b/);
+  assert.ok(Buffer.byteLength(icon) < 256 * 1024);
+  assert.doesNotMatch(icon, /<script\b|(?:href|src)=["']https?:\/\//i);
+  const titleEn = JSON.parse(
+    fs.readFileSync(path.join(packageRoot, "locale", "en.json"), "utf8"),
+  );
+  const titleZh = JSON.parse(
+    fs.readFileSync(path.join(packageRoot, "locale", "zh-CN.json"), "utf8"),
+  );
+  assert.equal(titleEn.meta.title, "dsh-manager Remote Access");
+  assert.equal(titleZh.meta.title, "dsh-manager 远程接入");
   assert.equal(pkg.dsh.client.platform, "web");
   assert.ok(
     pkg.dsh.client.inject.includes("@deepseek-ai/dsh-client-ui-settings"),
