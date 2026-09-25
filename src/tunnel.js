@@ -99,6 +99,16 @@ function headerValue(headers, name) {
   }
   return "";
 }
+function safeLogPath(value) {
+  try {
+    const target = new URL(String(value || "/"), "http://dsh.local");
+    return (
+      target.pathname + (target.search || target.hash ? "?[REDACTED]" : "")
+    );
+  } catch {
+    return "[invalid path]";
+  }
+}
 function acceptsGzip(value) {
   return String(value || "")
     .split(",")
@@ -217,7 +227,7 @@ export class ManagerTunnel {
     this.manager = managerUrls(options.serverUrl);
     console.info(
       "[dsh-manager-plugin] manager transport:",
-      this.manager.base.href,
+      this.manager.base.origin,
       "agentType=dsh-plugin",
     );
     this.capabilities = normalizeCapabilities(
@@ -883,7 +893,7 @@ export class ManagerTunnel {
     console.error(
       "[dsh-manager-plugin] proxy request failed:",
       message.method || "GET",
-      message.path,
+      safeLogPath(message.path),
       error.message,
     );
     if (record.streaming) {
@@ -1124,7 +1134,7 @@ export class ManagerTunnel {
       console.info(
         "[dsh-manager-plugin] proxy request:",
         message.method || "GET",
-        message.path,
+        safeLogPath(message.path),
       );
       deleteHeader(headers, "host");
       deleteHeader(headers, "connection");
@@ -1190,7 +1200,7 @@ export class ManagerTunnel {
       console.info(
         "[dsh-manager-plugin] proxy response:",
         message.method || "GET",
-        message.path,
+        safeLogPath(message.path),
         response.status,
         bytes.length + " bytes",
         response.headers["content-encoding"] || "identity",
@@ -1218,7 +1228,7 @@ export class ManagerTunnel {
         console.error(
           "[dsh-manager-plugin] proxy request failed:",
           message.method || "GET",
-          message.path,
+          safeLogPath(message.path),
           error.message,
         );
         if (record.streaming) {

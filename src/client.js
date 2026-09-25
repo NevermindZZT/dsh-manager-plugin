@@ -1,205 +1,206 @@
 import { jsx, jsxs } from "react/jsx-runtime";
-import { useEffect, useState } from "react";
-import { IconChevronDownOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";
-import { adoptStyles } from "./styles.js";
+import * as primitives from "@deepseek-ai/dsh-client-ui-primitives";
 
-const NS = "dsh-manager";
+const ENTRY_ID = "dsh-manager-plugin";
+const BUNDLE_ID = "@nevermindzzt/dsh-manager-plugin";
+const ENTRY_IDS = [ENTRY_ID, BUNDLE_ID];
+export const name = BUNDLE_ID;
+export const inject = ["slots"];
+const labels = {
+  unavailable: "当前 profile 未提供此插件的设置项。",
+  readOnly: "当前设置文档为只读。",
+  saveFailed: "保存失败，请检查连接后重试。",
+  save: "保存",
+  saving: "保存中…",
+};
 
-function validateServerUrl(value) {
-  try {
-    const url = new URL(value);
-    const httpsPorts = new Set(["443", "8443", "18443", "19443", "10091"]);
-    const httpPorts = new Set(["80", "8080", "18080", "19080", "10090"]);
-    if (url.protocol === "http:" && httpsPorts.has(url.port))
-      return "当前端口是 HTTPS/WSS 端口，请将 URL 改为 https://";
-    if (url.protocol === "https:" && httpPorts.has(url.port))
-      return "当前端口是 HTTP 端口，请改用 http:// 或填写 Agent HTTPS 端口";
-    return "";
-  } catch {
-    return "请输入有效的 Manager URL";
-  }
-}
-
-const FIELDS = [
-  ["serverUrl", "Manager URL"],
-  ["pairingCode", "首次配对码（仅注册时使用）"],
-  ["name", "Agent 名称"],
-  ["instanceId", "实例 ID"],
+const enabledField = {
+  field: "enabled",
+  format: (value) => (value === false ? "false" : "true"),
+  parse: (text) =>
+    text === "true" || text === "false"
+      ? { kind: "set", value: text === "true" }
+      : undefined,
+};
+const managerUrlField = {
+  field: "serverUrl",
+  format: (value) => String(value ?? ""),
+  parse: (text) => {
+    const value = text.trim();
+    if (value === "") return { kind: "clear" };
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "http:" && url.protocol !== "https:")
+        return undefined;
+      return { kind: "set", value };
+    } catch {
+      return undefined;
+    }
+  },
+};
+const fieldSpecs = [
+  enabledField,
+  managerUrlField,
+  primitives.settingsTextField("name"),
+  primitives.settingsTextField("instanceId"),
+];
+const secretSpecs = (scope) => [
+  {
+    field: "pairingCode",
+    write: (value) => scope.set("pairingCode", value),
+  },
 ];
 
-function valueOf(snapshot) {
-  const value = snapshot.value || {};
+function pairingCodeIsConfigured(describeFace, entryId) {
+  const view = describeFace.getSnapshot().view;
+  const namespace = view?.namespaces?.find((entry) => entry.ns === entryId);
+  return Boolean(
+    namespace?.secrets?.some(
+      (secret) =>
+        secret.path.length === 1 &&
+        secret.path[0] === "pairingCode" &&
+        secret.set,
+    ),
+  );
+}
+
+function buildFormState(model, describeFace, entryId) {
   return {
-    enabled: value.enabled !== false,
-    serverUrl: String(value.serverUrl || ""),
-    pairingCode: String(value.pairingCode || ""),
-    name: String(value.name || "dsh-plugin"),
-    instanceId: String(value.instanceId || "default"),
+    shell: model.shell(),
+    enabled: model.field("enabled"),
+    serverUrl: model.field("serverUrl"),
+    pairingCode: model.field("pairingCode"),
+    name: model.field("name"),
+    instanceId: model.field("instanceId"),
+    pairingCodeConfigured: pairingCodeIsConfigured(describeFace, entryId),
   };
 }
 
-function ManagerSettingsCard({ scope }) {
-  const [open, setOpen] = useState(false);
-  const [snapshot, setSnapshot] = useState(() => scope.getSnapshot());
-  const [draft, setDraft] = useState(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
+function ManagerSettingsCard(props) {
+  const state =
+    typeof props.useManagerSettings === "function"
+      ? props.useManagerSettings((snapshot) => snapshot)
+      : undefined;
+  if (state === undefined) return null;
 
-  useEffect(
-    () => scope.subscribe(() => setSnapshot(scope.getSnapshot())),
-    [scope],
-  );
-  if (snapshot.status !== "ready") return null;
+  const disabled =
+    !state.shell.available || !state.shell.writable || state.shell.saving;
+  const valueField = (field, label, hint, placeholder) =>
+    jsx(primitives.SettingsValueField, {
+      id: "dsh-manager-" + field,
+      label,
+      hint,
+      text: state[field].text,
+      overridden: state[field].overridden,
+      invalid: state[field].invalid,
+      overriddenLabel: "已自定义",
+      resetLabel: "恢复默认",
+      invalidLabel: "输入无效",
+      disabled,
+      placeholder,
+      onEdit: (value) => props.edit(field, value),
+      onReset: () => props.resetField(field),
+    });
 
-  const base = valueOf(snapshot);
-  const current = draft || base;
-  const dirty = draft !== null;
-  const edit = (field, value) => {
-    setError("");
-    setDraft({ ...current, [field]: value });
-  };
-  const save = async () => {
-    if (!dirty || saving || !snapshot.writable) return;
-    setSaving(true);
-    setError("");
-    const validationError = validateServerUrl(current.serverUrl);
-    if (validationError) {
-      setError(validationError);
-      return;
-    }
-    try {
-      for (const [field, value] of Object.entries(current))
-        await scope.set(field, value);
-      setDraft(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "保存失败");
-    } finally {
-      setSaving(false);
-    }
-  };
-  const discard = () => {
-    setDraft(null);
-    setError("");
-  };
-  const cardClass = open
-    ? "dsh-manager-card dsh-manager-card-open"
-    : "dsh-manager-card";
-  const chevronClass = open
-    ? "dsh-manager-card-chevron dsh-manager-card-chevron-open"
-    : "dsh-manager-card-chevron";
-
-  return jsxs("li", {
-    className: cardClass,
-    children: [
-      jsxs("button", {
-        type: "button",
-        className: "dsh-manager-card-header",
-        "aria-expanded": open,
-        onClick: () => setOpen(!open),
-        children: [
-          jsxs("span", {
-            className: "dsh-manager-card-head-text",
-            children: [
-              jsx("span", {
-                className: "dsh-manager-card-name",
-                children: "dsh-manager",
-              }),
-              jsx("span", {
-                className: "dsh-manager-card-description",
-                children: "配置 dsh 直连 manager",
-              }),
-            ],
-          }),
-          dirty
-            ? jsx("span", {
-                className: "dsh-manager-card-pending",
-                children: "未保存",
-              })
-            : null,
-          jsx(IconChevronDownOutline14, { className: chevronClass }),
-        ],
-      }),
-      open
-        ? jsxs("div", {
-            className: "dsh-manager-card-body",
-            children: [
-              jsx("label", {
-                className: "dsh-manager-field dsh-manager-field-inline",
-                children: [
-                  jsx("input", {
-                    className: "dsh-manager-checkbox",
-                    type: "checkbox",
-                    checked: current.enabled,
-                    onChange: (event) => edit("enabled", event.target.checked),
-                  }),
-                  jsx("span", {
-                    className: "dsh-manager-field-label",
-                    children: "启用 dsh-manager 直连",
-                  }),
-                ],
-              }),
-              ...FIELDS.map(([field, label]) =>
-                jsx(
-                  "label",
-                  {
-                    className: "dsh-manager-field",
-                    children: [
-                      jsx("span", {
-                        className: "dsh-manager-field-label",
-                        children: label,
-                      }),
-                      jsx("input", {
-                        className: "dsh-manager-input",
-                        type: field === "pairingCode" ? "password" : "text",
-                        value: current[field],
-                        onChange: (event) => edit(field, event.target.value),
-                      }),
-                    ],
-                  },
-                  field,
-                ),
-              ),
-              error
-                ? jsx("p", {
-                    className: "dsh-manager-card-failed",
-                    role: "status",
-                    children: error,
-                  })
-                : null,
-              jsxs("div", {
-                className: "dsh-manager-card-footer",
-                children: [
-                  jsx("button", {
-                    type: "button",
-                    className: "dsh-manager-card-discard",
-                    disabled: !dirty || saving,
-                    onClick: discard,
-                    children: "放弃修改",
-                  }),
-                  jsx("button", {
-                    type: "button",
-                    className: "dsh-manager-card-save",
-                    disabled: !dirty || saving || !snapshot.writable,
-                    onClick: () => void save(),
-                    children: saving ? "保存中…" : "保存",
-                  }),
-                ],
-              }),
-            ],
-          })
-        : null,
-    ],
+  return jsx(primitives.SettingsForm, {
+    labels,
+    state: state.shell,
+    onSave: props.save,
+    onDiscard: props.discard,
+    children: jsxs("div", {
+      className: "dsh-manager-settings-fields",
+      children: [
+        jsx(primitives.Switch, {
+          checked: state.enabled.text === "true",
+          onChange: (enabled) => props.edit("enabled", String(enabled)),
+          label: "启用 dsh-manager 连接",
+          title: "关闭后停止隧道，但保留本地 Agent 状态。",
+          disabled,
+        }),
+        valueField(
+          "serverUrl",
+          "Manager URL",
+          "支持 HTTP/HTTPS；清空覆盖后使用已有环境变量或本地配置。",
+          "http://manager:10090",
+        ),
+        jsx(primitives.SettingsSecretField, {
+          id: "dsh-manager-pairingCode",
+          label: "首次配对码",
+          hint: "仅首次注册或重新配对时填写；留空保持当前配对码。",
+          text: state.pairingCode.text,
+          configured: state.pairingCodeConfigured,
+          stateLabel: state.pairingCodeConfigured ? "已设置" : "未设置",
+          disabled,
+          onEdit: (value) => props.edit("pairingCode", value),
+        }),
+        valueField(
+          "name",
+          "Agent 名称",
+          "显示在 dsh-manager 上的 Agent 名称。",
+          "dsh-plugin",
+        ),
+        valueField(
+          "instanceId",
+          "实例 ID",
+          "同一 Manager 下区分多个 DSH 实例。",
+          "default",
+        ),
+      ],
+    }),
   });
 }
 
-export const inject = ["slots", "settingsScope"];
 export function apply(ctx) {
-  adoptStyles();
-  const scope = ctx.settingsScope.bind({ namespace: NS });
-  ctx.slots.inject("settings.plugin.item", () =>
-    ctx.slots.register(
-      { name: "settings.plugin.item", key: NS, inject: () => ({ scope }) },
-      ManagerSettingsCard,
-    ),
-  );
+  ctx.inject(["configForms"], (client) => {
+    const forms = client.configForms;
+    if (
+      forms === undefined ||
+      typeof forms.get !== "function" ||
+      typeof forms.describe !== "function" ||
+      typeof forms.whileServed !== "function"
+    )
+      return;
+
+    const describeFace = forms.describe();
+    client.effect(
+      () =>
+        forms.whileServed(ENTRY_IDS, (served) => {
+          const entryId = ENTRY_IDS.find((candidate) => served.has(candidate));
+          if (entryId === undefined) return () => {};
+
+          const scope = forms.get(entryId);
+          const model = new primitives.SettingsFormModel(
+            scope,
+            fieldSpecs,
+            secretSpecs(scope),
+          );
+          const store = model.bind(() =>
+            buildFormState(model, describeFace, entryId),
+          );
+          const actions = model.actions();
+          const injectForm = () => ({
+            hooks: { managerSettings: store },
+            edit: actions.edit,
+            resetField: actions.resetField,
+            save: actions.save,
+            discard: actions.discard,
+          });
+          const disposeSlot = client.slots.inject("plugins.bundle.config", () =>
+            client.slots.register(
+              {
+                name: "plugins.bundle.config",
+                key: BUNDLE_ID,
+                inject: injectForm,
+              },
+              ManagerSettingsCard,
+            ),
+          );
+          return () => {
+            disposeSlot();
+            model.dispose();
+          };
+        }),
+      "dsh-manager-plugin config form",
+    );
+  });
 }

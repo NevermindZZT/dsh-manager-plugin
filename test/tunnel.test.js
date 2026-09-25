@@ -192,6 +192,76 @@ test("manager URLs allow ordinary HTTP and HTTPS without port heuristics", () =>
   assert.throws(() => validateManagerUrl("wss://manager.example"), /http/);
 });
 
+test("manager transport logs omit URL credentials, path, query, and fragment", () => {
+  const entries = [];
+  const originalInfo = console.info;
+  console.info = (...args) => entries.push(args.map(String).join(" "));
+  try {
+    const tunnel = new ManagerTunnel({
+      serverUrl:
+        "https://user-secret:pass-secret@manager.example:10443/path-secret?token=secret-token#fragment-secret",
+      localOrigin: "http://127.0.0.1:1",
+    });
+    tunnel.close();
+  } finally {
+    console.info = originalInfo;
+  }
+  const output = entries.join("\n");
+  assert.match(output, /https:\/\/manager\.example:10443/);
+  for (const secret of [
+    "user-secret",
+    "pass-secret",
+    "path-secret",
+    "secret-token",
+    "fragment-secret",
+  ]) {
+    assert.equal(output.includes(secret), false, secret);
+  }
+});
+
+test("proxy logs redact query values from request paths", async () => {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("ok");
+  });
+  const port = await listen(server);
+  const entries = [];
+  const originalInfo = console.info;
+  const tunnel = new ManagerTunnel({
+    serverUrl: "http://manager.example:10090",
+    localOrigin: "http://127.0.0.1:" + port,
+  });
+  tunnel.socket = {
+    readyState: WebSocket.OPEN,
+    send() {},
+    close() {},
+  };
+  console.info = (...args) => entries.push(args.map(String).join(" "));
+  try {
+    await tunnel.proxyHttp({
+      requestId: "query-secret",
+      method: "GET",
+      path: "/api/agents?token=secret-token&key=secret-key",
+      headers: {},
+    });
+    const output = entries.join(String.fromCharCode(10));
+    assert.equal(
+      output.includes("proxy request: GET /api/agents?[REDACTED]"),
+      true,
+    );
+    assert.equal(
+      output.includes("proxy response: GET /api/agents?[REDACTED]"),
+      true,
+    );
+    assert.equal(output.includes("secret-token"), false);
+    assert.equal(output.includes("secret-key"), false);
+  } finally {
+    console.info = originalInfo;
+    tunnel.close();
+    await closeServer(server);
+  }
+});
+
 test("outbound scheduler is fair, prioritized, and bounded", async () => {
   const sent = [];
   const callbacks = [];

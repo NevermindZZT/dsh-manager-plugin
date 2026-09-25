@@ -4,14 +4,15 @@
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-本版本使用 DSH `0.1.2-rc.1` 提供的 `ctx.settings.installSection()` API，不再导入已移除的 `settingsNamespace` 或 `installSettingsSection` 顶层导出。
+本版本适配 DSH `0.1.7-rc.2`：插件以命名导出 `name`、`Config`、`inject`、`apply`，使 DSH loader 的 module namespace 保留 Config schema；client 端通过 `configForms.get/whileServed` 和 `plugins.bundle.config` slot 渲染 RC2 设置卡片。未被 DSH user layer 覆盖的 Manager URL、Agent 名称和实例 ID 会显示当前 environment/local-state 有效值；显式 DSH user overrides 优先。字段使用 volatile schema，`pairingCode` 使用 `secret` role 并以 write-only 控件保存。Host-side `describe({ redactSecrets: true })` 只把非敏感 user overrides 交给隧道配置解析；配对码仅从 volatile Config/受保护的本地状态读取，不放入 descriptor user data。settings 更新按 `settings/document-updated(ns, revision)` 处理并忽略重复或过期 revision；不再使用旧 `settingsScope` / `settings.plugin.item` API。
+
 ## 0.2.3 transport and relay optimization
 
 - 移除私有证书、TLS fingerprint 和证书 pinning；
 - manager 使用单一 HTTP upstream 端口；
 - 可信内网可直接使用 `http://manager:port`；
 - 公网 HTTPS/WSS 由 Cloudflare Tunnel 或其他反向代理终止，manager upstream 仍使用 HTTP；
-- DSH 0.1.2-rc.1 startup URL 只在内存中保存，绝不写入 plugin state 或日志；
+- DSH Web startup URL 只在内存中保存，绝不写入 plugin state 或日志；Manager transport 仅记录 origin，不记录 URL userinfo、path、query 或 fragment；
 - 首个 manager 标记的根请求使用 startup token，随后通过 Cookie 使用干净 URL；
 - WebSocket tunnel 会转发浏览器 Cookie；
 - 对浏览器支持 gzip 的请求保留 DSH gzip 响应，避免在 Agent WebSocket 上传输未压缩静态资源；
@@ -60,10 +61,10 @@ dsh web
 进入：
 
 ```text
-设置 → 插件 → 插件配置 → dsh-manager
+设置 → 插件 → dsh-manager-plugin → 配置
 ```
 
-配置项：启用 dsh-manager 直连、Manager URL、首次配对码、Agent 名称和实例 ID。没有 TLS fingerprint 配置项。保存后插件会重新建立连接。
+原生配置表单提供启用开关、Manager URL、首次配对码、Agent 名称和实例 ID；首次配对码为 secret/write-only 字段。空 Config 字段继续回退到现有 `~/.dsh/manager-agent.json`，显式设置的 Config 值优先。RC2 的 `settings/document-updated(ns, revision)` 会刷新本插件设置并重建隧道；重复或过期 revision 不会重复重建。更换配对码不会清除已有 Agent Token。没有 TLS fingerprint 配置项。
 
 ## Manager URL
 
@@ -100,11 +101,11 @@ DSH_MANAGER_INSTANCE_ID=default
 ~/.dsh/manager-agent.json
 ```
 
-保存内容包括 Agent ID、Agent Token、manager URL、Agent 名称和实例 ID。startup URL/token 不会保存。
+保存内容包括 Agent ID、Agent Token、manager URL、Agent 名称、实例 ID，以及用于重新 enrollment 的 pairing code。状态文件权限为 `0600`；startup URL/token 不会保存，日志和远端 Settings descriptor 不暴露 pairing code。
 
-## DSH 0.1.2-rc.1 bootstrap
+## DSH Web bootstrap
 
-DSH Web UI 只接受启动时打印的 `GET /?token=...`，成功后颁发 Cookie 并重定向到 `/`。插件通过 `ctx.connection.authenticatedUrl()` 得到启动 URL，但只把它保存在当前进程内存中：
+DSH Web UI 只接受启动时打印的一次性 `GET /?token=...`，成功后颁发 Cookie 并重定向到 `/`。插件通过 `ctx.connection.authenticatedUrl()` 得到启动 URL，但只把它保存在当前进程内存中：
 
 1. manager 对新的 `/dsh/<session>/` 根请求发送 `bootstrap:true`；
 2. 插件才访问内存中的 startup URL；
@@ -129,7 +130,7 @@ npm install
 npm test
 ```
 
-测试覆盖 HTTP manager transport、enrollment 生命周期、DSH startup bootstrap、Set-Cookie、gzip 响应保留、二进制 HTTP 响应帧、HTTP proxy 和 authenticated WebSocket Cookie forwarding。
+测试覆盖 HTTP manager transport、enrollment 生命周期、DSH 0.1.7 Config defaults/volatile/secret metadata、旧 saved-state 回退、ConfigForms 更新触发隧道重建、DSH startup bootstrap、Set-Cookie、gzip、二进制/流式 HTTP 和 authenticated WebSocket Cookie forwarding。
 
 ## 相关项目
 
