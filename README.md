@@ -28,12 +28,10 @@
 
 ```text
 浏览器
-  ↓ HTTP / WebSocket（或外部代理终止后的 HTTPS / WSS）
-dsh-manager 单一 HTTP 端口
-  ↓ HTTP / WS Agent Protocol v1
-dsh-manager-plugin
-  ↓ 本地 dsh HTTP / WebSocket
-当前 dsh 实例
+  ├─ Manager 隧道：HTTP / WSS → dsh-manager 单一 HTTP 端口 → Agent Protocol v1 ─┐
+  └─ 局域网直连：HTTP → dsh-manager-plugin 额外监听端口 ──────────────────────┤
+                                                                                ↓
+                                                         当前 DSH 实例（loopback HTTP / WebSocket）
 ```
 
 插件只能代理当前 dsh 实例，不提供任意 shell 或 launcher 生命周期命令。
@@ -45,6 +43,7 @@ dsh-manager-plugin
 - WS/WSS Agent 长连接（WSS 由外部代理提供）；
 - HTTP 请求反向代理；
 - WebSocket 双向代理；
+- 可选独立局域网直连 HTTP / WebSocket 入口（默认关闭，不依赖 Manager 隧道）；
 - settings.host、plugin.config、`dsh.web.bootstrap-v1` 和 `proxy.binary-response-v1` 能力声明；
 - Agent Token 本地持久化；
 - pairing code 刷新不会使已有 Agent Token 失效；
