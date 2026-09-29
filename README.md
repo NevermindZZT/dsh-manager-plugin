@@ -70,7 +70,30 @@ dsh web
 设置 → 插件 → dsh-manager-plugin → 配置
 ```
 
-原生配置表单提供启用开关、Manager URL、首次配对码、Agent 名称和实例 ID；首次配对码为 secret/write-only 字段。空 Config 字段继续回退到现有 `~/.dsh/manager-agent.json`，显式设置的 Config 值优先。RC2 的 `settings/document-updated(ns, revision)` 会刷新本插件设置并重建隧道；重复或过期 revision 不会重复重建。更换配对码不会清除已有 Agent Token。没有 TLS fingerprint 配置项。
+原生配置表单提供 Manager 隧道设置，以及独立的局域网直连设置。首次配对码和直连访问密码均为 secret/write-only 字段。Manager URL 为空时仍可单独启用直连监听；直连默认关闭并绑定 `127.0.0.1`。RC2 的 `settings/document-updated(ns, revision)` 会刷新设置并分别重建对应服务；重复或过期 revision 不会重复重建。更换配对码不会清除已有 Agent Token。没有 TLS fingerprint 配置项。
+
+## 独立局域网直连
+
+此模式由插件直接监听一个额外 HTTP 端口，将请求转发到 DSH Web 的 loopback 地址，不经过 `dsh-manager`：
+
+```text
+其他设备浏览器 → dsh-manager-plugin 监听端口 → http://127.0.0.1:<DSH Web 端口>
+```
+
+启用位置：
+
+```text
+设置 → 插件 → dsh-manager-plugin → 配置 → 局域网直连
+```
+
+- 默认关闭，默认监听 `127.0.0.1:3081`；只想本机测试时保持该地址。
+- 要允许同一局域网其他设备访问，将监听地址设为 `0.0.0.0`，端口默认 `3081`，并在浏览器访问 `http://<运行 DSH 的电脑局域网 IP>:3081/`。该版本按 Host 与本机接收网卡地址比对；请使用网卡 IP，不支持任意 DNS 别名或放在另一个反向代理后面。
+- 访问密码可选；设置时至少 8 位。插件使用 HttpOnly、SameSite Strict 的短时登录 Cookie；密码变更或 DSH 重启后，旧登录会话会失效。设置页的“清除已保存密码”会移除密码配置。
+- **无密码时，任何能够连接监听端口的设备都可以使用完整 DSH Web 权限**；它不是只读页面，也没有按用户区分权限。只在你信任的局域网中启用。
+- 当前直连端口使用普通 HTTP。HTTP 不加密密码、Cookie、提示词或回复内容，只用于可信局域网；不要将端口直接映射到公网。跨不可信网络访问请使用 VPN，或另行配置带 Host/Origin 校验与身份认证的 HTTPS 入口。
+- 防火墙仍需允许运行 DSH 的电脑接收该端口；端口冲突会导致插件报告监听失败。
+
+直连服务与 Manager 隧道是独立开关：可只用直连而不配置 Manager URL，也可以同时使用两种入口。
 
 ## Manager URL
 

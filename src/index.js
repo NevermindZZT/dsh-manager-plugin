@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import z from "@deepseek-ai/schemastery";
 import { ManagerTunnel } from "./tunnel.js";
+import { DirectAccessServer } from "./direct-access.js";
 import { shouldAllowEnrollment } from "./protocol.js";
 
 export const name = "dsh-manager-plugin";
@@ -28,6 +29,11 @@ export const DSH_MANAGER_SETTINGS_SCHEMA = z.object({
   pairingCode: volatile(z.string().default("").role("secret")),
   name: volatile(z.string().default(DEFAULT_AGENT_NAME)),
   instanceId: volatile(z.string().default(DEFAULT_INSTANCE_ID)),
+  directAccessEnabled: volatile(z.boolean().default(false)),
+  directAccessHost: volatile(z.string().default("127.0.0.1")),
+  directAccessPort: volatile(z.number().default(3081)),
+  // No empty default: DSH marks an empty secret default as configured.
+  directAccessPassword: volatile(z.string().role("secret")),
 });
 export const Config = DSH_MANAGER_SETTINGS_SCHEMA;
 
@@ -76,9 +82,9 @@ export function resolveManagerSettings(
 
 function projectEffectiveSettings(config, settings) {
   if (config === null || typeof config !== "object") return;
-  // ConfigForms reads the live Fiber config. Reflect only non-secret effective
-  // values so env/local-state fallbacks are visible in the settings card; never
-  // copy the pairing code or Agent credentials into the descriptor.
+  // Manager fields can fall back to environment/local state. Direct-access
+  // fields have no external fallback, so do not mirror them into Config: doing
+  // so would turn a user reset into a new effective override.
   for (const field of ["serverUrl", "name", "instanceId"]) {
     const current = config[field];
     try {
@@ -94,8 +100,9 @@ export function listenForSettingsUpdates(ctx, onUpdate) {
     const lastRevisions = new Map();
     const refresh = (expectedRevision, expectedEntryId) => {
       try {
-        // Only non-secret user overrides are needed here. The pairing code is
-        // read from the volatile Config value, never from the descriptor.
+        // Ordinary overrides stay redacted. Read only this plugin's direct
+        // password when its secret slot is marked configured; never forward,
+        // log, or retain other plugin secrets.
         const descriptors = sctx.settings.describe({ redactSecrets: true });
         const descriptor =
           descriptors.find((entry) => entry.ns === expectedEntryId) ??
@@ -119,10 +126,37 @@ export function listenForSettingsUpdates(ctx, onUpdate) {
           return;
         if (entryId && typeof revision === "number")
           lastRevisions.set(entryId, revision);
-        onUpdate(descriptor?.user);
+        const passwordIsSet = Boolean(
+          descriptor?.secrets?.some(
+            (secret) =>
+              secret.path.length === 1 &&
+              secret.path[0] === "directAccessPassword" &&
+              secret.set,
+          ),
+        );
+        let directAccessPassword = "";
+        if (passwordIsSet) {
+          const full = sctx.settings
+            .describe()
+            .find((entry) => entry.ns === entryId);
+          directAccessPassword = String(
+            full?.user?.directAccessPassword ||
+              full?.value?.directAccessPassword ||
+              "",
+          );
+        }
+        onUpdate(descriptor?.user, {
+          directAccessPassword,
+          directAccessPasswordConfigured: passwordIsSet,
+        });
       } catch {
         if (expectedEntryId) lastRevisions.delete(expectedEntryId);
-        onUpdate(undefined);
+        // If the Settings store cannot be read, fail closed rather than silently
+        // turning a previously configured external listener into open access.
+        onUpdate(undefined, {
+          directAccessPassword: "",
+          directAccessPasswordConfigured: true,
+        });
       }
     };
     refresh();
@@ -138,6 +172,37 @@ export function listenForSettingsUpdates(ctx, onUpdate) {
       refresh(revision, entryId);
     });
   });
+}
+
+export function resolveDirectAccessSettings(
+  config = {},
+  userConfig,
+  secretConfig = {},
+) {
+  const directAccessEnabled = configValue(config.directAccessEnabled);
+  const directAccessHost = configValue(config.directAccessHost);
+  const directAccessPort = configValue(config.directAccessPort);
+  const hasUserValue = (key) =>
+    userConfig !== undefined && Object.hasOwn(userConfig, key);
+  const effective = (key, current, fallback) =>
+    hasUserValue(key)
+      ? (configValue(userConfig[key]) ?? current ?? fallback)
+      : (current ?? fallback);
+  const hasSecretSnapshot =
+    typeof secretConfig.directAccessPasswordConfigured === "boolean";
+  const configPassword = String(configValue(config.directAccessPassword) || "");
+  const password = hasSecretSnapshot
+    ? String(secretConfig.directAccessPassword || "")
+    : configPassword;
+  return {
+    enabled: effective("directAccessEnabled", directAccessEnabled, false),
+    host: effective("directAccessHost", directAccessHost, "127.0.0.1"),
+    port: Number(effective("directAccessPort", directAccessPort, 3081)),
+    password,
+    passwordConfigured: hasSecretSnapshot
+      ? secretConfig.directAccessPasswordConfigured
+      : configPassword.length > 0,
+  };
 }
 
 export function resolveTunnelCredentials(
@@ -202,15 +267,81 @@ export function applyManagerAgent(
   config = {},
   Tunnel = ManagerTunnel,
   env = process.env,
+  DirectServer = DirectAccessServer,
 ) {
   const file = statePath(config);
   let saved = readState(file);
   let tunnel = null;
+  let directServer = null;
   let disposed = false;
   let syncScheduled = false;
   let lastSettingsKey = "";
+  let lastDirectSettings = null;
   let syncGeneration = 0;
+  let directGeneration = 0;
   let userConfig;
+  let secretConfig = {};
+
+  const syncDirectAccess = (settings) => {
+    const previousSettings = lastDirectSettings;
+    if (
+      previousSettings &&
+      previousSettings.enabled === settings.enabled &&
+      previousSettings.host === settings.host &&
+      previousSettings.port === settings.port &&
+      previousSettings.password === settings.password &&
+      previousSettings.passwordConfigured === settings.passwordConfigured
+    )
+      return;
+    lastDirectSettings = { ...settings };
+    const generation = ++directGeneration;
+    const previousServer = directServer;
+    directServer = null;
+    const replace = async () => {
+      try {
+        await previousServer?.close();
+      } catch {}
+      if (disposed || generation !== directGeneration || !settings.enabled)
+        return;
+      const localOrigin = "http://127.0.0.1:" + ctx.webServer.port;
+      let nextServer;
+      try {
+        nextServer = new DirectServer({
+          host: settings.host,
+          port: settings.port,
+          password: settings.password,
+          passwordConfigured: settings.passwordConfigured,
+          localOrigin,
+          startupUrl: ctx.connection.authenticatedUrl(localOrigin),
+          onError: (error) => {
+            if (disposed || generation !== directGeneration) return;
+            console.error(
+              "[dsh-manager-plugin] direct access error:",
+              error.message,
+            );
+            config.onError?.(error);
+          },
+        });
+        directServer = nextServer;
+        await nextServer.start();
+        if (disposed || generation !== directGeneration) {
+          if (directServer === nextServer) directServer = null;
+          await nextServer.close();
+        }
+      } catch (error) {
+        if (directServer === nextServer) directServer = null;
+        if (!disposed && generation === directGeneration) {
+          console.error(
+            "[dsh-manager-plugin] direct access failed to start:",
+            error.message,
+          );
+          config.onError?.(error);
+        }
+        await nextServer?.close();
+      }
+    };
+    void replace();
+  };
 
   const syncTunnel = () => {
     if (disposed) return;
@@ -220,7 +351,15 @@ export function applyManagerAgent(
       env,
       userConfig,
     );
+    const directSettings = resolveDirectAccessSettings(
+      config,
+      userConfig,
+      secretConfig,
+    );
     projectEffectiveSettings(config, settingsSnapshot);
+    // This listener is independent of the outbound Manager connection.
+    syncDirectAccess(directSettings);
+
     const settingsKey = JSON.stringify(settingsSnapshot);
     if (settingsKey === lastSettingsKey) return;
     lastSettingsKey = settingsKey;
@@ -251,8 +390,8 @@ export function applyManagerAgent(
     if (!settingsSnapshot.enabled || !settingsSnapshot.serverUrl) {
       tunnel = null;
       previousTunnel?.close();
-      console.warn(
-        "[dsh-manager-plugin] disabled: configure dsh-manager in Settings or set DSH_MANAGER_URL",
+      console.info(
+        "[dsh-manager-plugin] Manager tunnel disabled; direct access is configured independently",
       );
       return;
     }
@@ -319,8 +458,7 @@ export function applyManagerAgent(
   const scheduleSync = () => {
     if (syncScheduled) return;
     syncScheduled = true;
-    // Never perform enrollment or socket setup during plugin apply. Let dsh
-    // finish booting first; the tunnel is an optional background service.
+    // Start listeners after dsh has finished booting its web server.
     const timer = setTimeout(() => {
       syncScheduled = false;
       if (!disposed) syncTunnel();
@@ -328,15 +466,21 @@ export function applyManagerAgent(
     timer.unref?.();
   };
 
-  listenForSettingsUpdates(ctx, (currentUserConfig) => {
+  listenForSettingsUpdates(ctx, (currentUserConfig, currentSecretConfig) => {
     userConfig = currentUserConfig;
+    secretConfig = currentSecretConfig || {};
     scheduleSync();
   });
   scheduleSync();
-  return () => {
+  return async () => {
     disposed = true;
+    syncGeneration++;
+    directGeneration++;
     tunnel?.close();
     tunnel = null;
+    const server = directServer;
+    directServer = null;
+    await server?.close();
   };
 }
 

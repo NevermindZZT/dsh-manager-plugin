@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "dsh-manager 远程接入",
-    "description": "通过安全反向隧道连接 DeepSeek Harness 与 dsh-manager，支持 Agent 注册和远程访问。"
+    "description": "连接 dsh-manager，或在受控局域网内直接安全访问 DSH Web。"
   }
 }

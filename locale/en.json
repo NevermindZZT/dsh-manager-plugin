@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "dsh-manager Remote Access",
-    "description": "Secure reverse tunnel and Agent registration for DeepSeek Harness."
+    "description": "Connect through dsh-manager or directly access DSH Web on a controlled LAN."
   }
 }

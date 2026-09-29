@@ -15,6 +15,7 @@ import {
   inject,
   listenForSettingsUpdates,
   name,
+  resolveDirectAccessSettings,
   resolveManagerSettings,
   resolveTunnelCredentials,
 } from "../src/index.js";
@@ -53,6 +54,9 @@ test("DSH 0.1.7-rc.2 discovers named plugin Config and defaults", () => {
     pairingCode: "",
     name: "dsh-plugin",
     instanceId: "default",
+    directAccessEnabled: false,
+    directAccessHost: "127.0.0.1",
+    directAccessPort: 3081,
   });
 });
 
@@ -64,12 +68,75 @@ test("every editable field serializes volatile metadata and pairing code is secr
     "pairingCode",
     "name",
     "instanceId",
+    "directAccessEnabled",
+    "directAccessHost",
+    "directAccessPort",
+    "directAccessPassword",
   ]) {
     assert.equal(fields[key].meta.volatile, true, key);
     assert.equal(serializedMeta(fields[key]).volatile, true, key);
   }
   assert.equal(fields.pairingCode.meta.role, "secret");
   assert.equal(serializedMeta(fields.pairingCode).role, "secret");
+  assert.equal(fields.directAccessPassword.meta.role, "secret");
+  assert.equal(serializedMeta(fields.directAccessPassword).role, "secret");
+});
+
+test("direct access settings default closed and resolve independently of Manager URL", () => {
+  const config = {
+    directAccessEnabled: volatile(false),
+    directAccessHost: volatile("127.0.0.1"),
+    directAccessPort: volatile(3081),
+    directAccessPassword: volatile("direct-secret"),
+  };
+  assert.deepEqual(resolveDirectAccessSettings(config), {
+    enabled: false,
+    host: "127.0.0.1",
+    port: 3081,
+    password: "direct-secret",
+    passwordConfigured: true,
+  });
+  assert.deepEqual(
+    resolveDirectAccessSettings(config, {
+      directAccessEnabled: true,
+      directAccessHost: "0.0.0.0",
+      directAccessPort: 43123,
+    }),
+    {
+      enabled: true,
+      host: "0.0.0.0",
+      port: 43123,
+      password: "direct-secret",
+      passwordConfigured: true,
+    },
+  );
+  const settingsSecret = resolveDirectAccessSettings(
+    {
+      directAccessEnabled: volatile(true),
+      directAccessHost: volatile("0.0.0.0"),
+      directAccessPort: volatile(43123),
+      directAccessPassword: volatile(""),
+    },
+    undefined,
+    {
+      directAccessPassword: "secret-from-settings",
+      directAccessPasswordConfigured: true,
+    },
+  );
+  assert.equal(settingsSecret.password, "secret-from-settings");
+  assert.equal(settingsSecret.passwordConfigured, true);
+  const noPassword = resolveDirectAccessSettings(
+    {
+      directAccessEnabled: volatile(true),
+      directAccessHost: volatile("0.0.0.0"),
+      directAccessPort: volatile(43123),
+      directAccessPassword: volatile("stale-value"),
+    },
+    undefined,
+    { directAccessPassword: "", directAccessPasswordConfigured: false },
+  );
+  assert.equal(noPassword.password, "");
+  assert.equal(noPassword.passwordConfigured, false);
 });
 
 test("legacy saved connection settings survive empty DSH Config defaults", () => {
@@ -216,6 +283,59 @@ test("rc.2 SettingsForms revisions refresh only this plugin's config", () => {
   assert.deepEqual(updates[2], user);
 });
 
+test("direct password resolves only from this plugin's local secret slot", () => {
+  const documentUpdated = new Map();
+  let fullDescribeCalls = 0;
+  let result;
+  const ctx = {
+    inject(services, callback) {
+      assert.deepEqual(services, ["settings"]);
+      callback({
+        settings: {
+          describe(options) {
+            if (options?.redactSecrets === true)
+              return [
+                {
+                  ns: DSH_MANAGER_SETTINGS_ENTRY_ID,
+                  user: { directAccessEnabled: true },
+                  revision: 1,
+                  secrets: [{ path: ["directAccessPassword"], set: true }],
+                },
+              ];
+            fullDescribeCalls++;
+            return [
+              {
+                ns: "other-plugin",
+                value: { apiToken: "must-not-escape" },
+              },
+              {
+                ns: DSH_MANAGER_SETTINGS_ENTRY_ID,
+                value: { directAccessPassword: "test-secret-123" },
+                user: { directAccessPassword: "test-secret-123" },
+              },
+            ];
+          },
+        },
+        on(event, listener) {
+          documentUpdated.set(event, listener);
+        },
+      });
+    },
+  };
+  listenForSettingsUpdates(ctx, (user, secrets) => {
+    result = { user, secrets };
+  });
+  assert.equal(fullDescribeCalls, 1);
+  assert.deepEqual(result, {
+    user: { directAccessEnabled: true },
+    secrets: {
+      directAccessPassword: "test-secret-123",
+      directAccessPasswordConfigured: true,
+    },
+  });
+  assert.equal(Object.hasOwn(result.secrets, "apiToken"), false);
+});
+
 test("SettingsForms listener accepts the scoped profile entry ID", () => {
   let currentUser = { name: "scoped-agent" };
   let revision = 1;
@@ -260,7 +380,7 @@ test("SettingsForms listener accepts the scoped profile entry ID", () => {
   assert.equal(updates.length, 2);
 });
 
-test("RC2 package branding and ConfigForms client resolve scoped namespace", () => {
+test("RC2 package branding and ConfigForms client resolve scoped namespace", async () => {
   assert.equal(pkg.icon, "./icon.svg");
   assert.equal(pkg.exports["./locale/*.json"], "./locale/*.json");
   assert.ok(pkg.files.includes("icon.svg"));
@@ -300,6 +420,7 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
   );
   let definition;
   runInNewContext(clientBundle, {
+    navigator: { language: "zh-CN" },
     window: {
       __ModuleLoader__: {
         load(value) {
@@ -312,6 +433,7 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
 
   const registrations = [];
   const disposers = [];
+  const mutations = [];
   const scope = {
     getSnapshot: () => ({
       status: "ready",
@@ -320,6 +442,10 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
         serverUrl: "",
         name: "dsh-plugin",
         instanceId: "default",
+        directAccessEnabled: false,
+        directAccessHost: "127.0.0.1",
+        directAccessPort: 3081,
+        directAccessPassword: "",
       },
       base: {},
       user: {},
@@ -329,7 +455,10 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
     }),
     subscribe: () => () => {},
     set: async () => true,
-    mutate: async () => true,
+    mutate: async (operations) => {
+      mutations.push(operations);
+      return true;
+    },
   };
   let formModel;
   class FakeSettingsFormModel {
@@ -375,6 +504,7 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
     SettingsValueField() {},
     SettingsSecretField() {},
     Switch() {},
+    Button() {},
     settingsTextField: (field) => ({ field }),
   };
   const element = (type, props) => ({ type, props });
@@ -398,7 +528,10 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
             namespaces: [
               {
                 ns: DSH_MANAGER_SETTINGS_ENTRY_PACKAGE_ID,
-                secrets: [{ path: ["pairingCode"], set: true }],
+                secrets: [
+                  { path: ["pairingCode"], set: true },
+                  { path: ["directAccessPassword"], set: true },
+                ],
               },
             ],
           },
@@ -444,15 +577,33 @@ test("RC2 package branding and ConfigForms client resolve scoped namespace", () 
     resetField() {},
     save() {},
     discard() {},
+    clearDirectAccessPassword: async () => true,
   });
   const rows = card.props.children.props.children;
-  assert.equal(rows.length, 5);
-  assert.equal(rows[0].type, primitives.Switch);
-  assert.equal(rows[1].type, primitives.SettingsValueField);
-  assert.equal(rows[2].type, primitives.SettingsSecretField);
-  assert.equal(rows[2].props.configured, true);
-  assert.equal(rows[2].props.label, "首次配对码");
+  assert.equal(rows.length, 13);
+  assert.equal(rows[0].type, "h3");
+  assert.equal(rows[1].type, primitives.Switch);
+  assert.equal(rows[2].type, primitives.SettingsValueField);
+  assert.equal(rows[3].type, primitives.SettingsSecretField);
+  assert.equal(rows[3].props.configured, true);
+  assert.equal(rows[3].props.label, "首次配对码");
+  assert.equal(rows[6].type, "h3");
+  assert.equal(rows[7].type, primitives.Switch);
+  assert.equal(rows[8].type, primitives.SettingsValueField);
+  assert.equal(rows[9].type, primitives.SettingsValueField);
+  assert.equal(rows[10].type, primitives.SettingsSecretField);
+  assert.equal(rows[10].props.configured, true);
+  assert.equal(rows[10].props.label, "直连访问密码");
+  assert.equal(rows[11].type, primitives.Button);
+  assert.equal(rows[11].props.children, "清除已保存密码（恢复无密码访问）");
   assert.equal(formModel.state.pairingCodeConfigured, true);
+  assert.equal(formModel.state.directAccessPasswordConfigured, true);
+  const injected = registrations[0].metadata.inject();
+  assert.equal(typeof injected.clearDirectAccessPassword, "function");
+  await injected.clearDirectAccessPassword();
+  assert.deepEqual(JSON.parse(JSON.stringify(mutations)), [
+    [{ op: "unset", path: ["directAccessPassword"] }],
+  ]);
   for (const dispose of disposers) dispose?.();
   assert.equal(formModel.disposed, true);
 });
@@ -606,6 +757,101 @@ test("settings updates rebuild the tunnel and preserve saved Agent credentials",
     assert.equal(persisted.agentToken, saved.agentToken);
   } finally {
     dispose?.();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("direct access listener starts without a Manager URL and closes on plugin disposal", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "dsh-manager-plugin-direct-"),
+  );
+  const statePath = path.join(directory, "manager-agent.json");
+  const revision = 1;
+  const user = {
+    directAccessEnabled: true,
+    directAccessHost: "127.0.0.1",
+    directAccessPort: 43123,
+  };
+  const listeners = new Map();
+  const servers = [];
+  const tunnels = [];
+  class FakeTunnel {
+    constructor(options) {
+      this.options = options;
+      tunnels.push(this);
+    }
+    start() {
+      return Promise.resolve();
+    }
+    close() {}
+  }
+  class FakeDirectServer {
+    constructor(options) {
+      this.options = options;
+      this.started = false;
+      this.closed = false;
+      servers.push(this);
+    }
+    start() {
+      this.started = true;
+      return Promise.resolve({
+        host: this.options.host,
+        port: this.options.port,
+      });
+    }
+    close() {
+      this.closed = true;
+      return Promise.resolve();
+    }
+  }
+  const ctx = {
+    webServer: { port: 12345 },
+    connection: { authenticatedUrl: (baseUrl) => baseUrl + "?token=launch" },
+    inject(services, callback) {
+      assert.deepEqual(services, ["settings"]);
+      callback({
+        settings: {
+          describe: () => [
+            { ns: DSH_MANAGER_SETTINGS_ENTRY_ID, user, revision },
+          ],
+        },
+        on(event, listener) {
+          listeners.set(event, listener);
+        },
+      });
+    },
+  };
+  const config = {
+    statePath,
+    enabled: volatile(true),
+    serverUrl: volatile(""),
+    pairingCode: volatile(""),
+    name: volatile("dsh-plugin"),
+    instanceId: volatile("default"),
+    directAccessEnabled: volatile(false),
+    directAccessHost: volatile("127.0.0.1"),
+    directAccessPort: volatile(3081),
+    directAccessPassword: volatile("loopback-password"),
+  };
+  const pauseForSync = () => new Promise((resolve) => setTimeout(resolve, 20));
+  let dispose;
+  try {
+    dispose = applyManagerAgent(ctx, config, FakeTunnel, {}, FakeDirectServer);
+    await pauseForSync();
+    assert.equal(tunnels.length, 0);
+    assert.equal(servers.length, 1);
+    assert.equal(servers[0].started, true);
+    assert.equal(servers[0].options.host, "127.0.0.1");
+    assert.equal(servers[0].options.port, 43123);
+    assert.equal(servers[0].options.localOrigin, "http://127.0.0.1:12345");
+    assert.equal(
+      servers[0].options.startupUrl,
+      "http://127.0.0.1:12345?token=launch",
+    );
+    await dispose();
+    assert.equal(servers[0].closed, true);
+  } finally {
+    await dispose?.();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
