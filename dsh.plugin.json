@@ -1,6 +1,6 @@
 {
   "id": "dsh-manager-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "main": "src/index.js",
   "description": "dsh-manager tunnel, direct LAN access, and settings for dsh"
 }

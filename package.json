@@ -1,6 +1,6 @@
 {
   "name": "@nevermindzzt/dsh-manager-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "dsh-manager tunnel and direct LAN access for DeepSeek Harness",
   "icon": "./icon.svg",
   "type": "module",

@@ -1,6 +1,6 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.3.0-blue)
+![Version](https://img.shields.io/badge/version-v0.4.0-blue)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -52,7 +52,7 @@
 ## 安装
 
 ```powershell
-dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.3.0
+dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.4.0
 ```
 
 安装后重启 dsh：
