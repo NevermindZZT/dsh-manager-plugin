@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import { test } from "node:test";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { WebSocketServer } from "ws";
 import { shouldAllowEnrollment, validateManagerUrl } from "../src/protocol.js";
 import { ManagerTunnel } from "../src/tunnel.js";
+
+function socketLifecycle() {
+  const events = new EventEmitter();
+  return {
+    once: events.once.bind(events),
+    on: events.on.bind(events),
+    terminate: () => events.emit("close"),
+  };
+}
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -234,7 +244,7 @@ test("proxy logs redact query values from request paths", async () => {
   tunnel.socket = {
     readyState: WebSocket.OPEN,
     send() {},
-    close() {},
+    ...socketLifecycle(),
   };
   console.info = (...args) => entries.push(args.map(String).join(" "));
   try {
@@ -281,7 +291,7 @@ test("outbound scheduler is fair, prioritized, and bounded", async () => {
       );
       callbacks.push(callback);
     },
-    close() {},
+    ...socketLifecycle(),
   };
   const release = async () => {
     callbacks.shift()();
@@ -335,7 +345,7 @@ test("outbound scheduler is fair, prioritized, and bounded", async () => {
     bounded.socket = {
       readyState: WebSocket.OPEN,
       send() {},
-      close() {},
+      ...socketLifecycle(),
     };
     const active = bounded.sendAsync({
       type: "proxy_response",
@@ -379,7 +389,7 @@ test("buffered HTTP proxy response respects configured byte limit", async () => 
     send(payload) {
       messages.push(JSON.parse(payload));
     },
-    close() {},
+    ...socketLifecycle(),
   };
   try {
     await tunnel.proxyHttp({

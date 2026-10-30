@@ -48,7 +48,15 @@ test("DSH 0.1.7-rc.2 discovers named plugin Config and defaults", () => {
   assert.deepEqual(inject, ["webServer", "connection"]);
   assert.equal(DSH_MANAGER_SETTINGS_ENTRY_ID, "dsh-manager-plugin");
   assert.match(manifest, /id: dsh-manager-plugin/);
-  assert.deepEqual(DSH_MANAGER_SETTINGS_SCHEMA({}), {
+  const defaults = Object.fromEntries(
+    Object.entries(DSH_MANAGER_SETTINGS_SCHEMA({}))
+      .map(([key, value]) => [
+        key,
+        typeof value?.get === "function" ? value.get() : value,
+      ])
+      .filter(([, value]) => value !== undefined),
+  );
+  assert.deepEqual(defaults, {
     enabled: true,
     serverUrl: "",
     pairingCode: "",

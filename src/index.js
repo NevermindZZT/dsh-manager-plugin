@@ -275,6 +275,30 @@ export function applyManagerAgent(
   let directServer = null;
   let disposed = false;
   let syncScheduled = false;
+  let syncTimer = null;
+  let cleanupPromise;
+  let directTask = Promise.resolve();
+  const closingResources = new WeakMap();
+  const pendingCloses = new Set();
+  // A resource can be reached by both an in-flight replacement and disposal.
+  // Invoke close only once, but let every owner await the same completion.
+  const closeResource = (resource) => {
+    if (!resource) return Promise.resolve();
+    if (closingResources.has(resource)) return closingResources.get(resource);
+    let task;
+    try {
+      task = Promise.resolve(resource.close());
+    } catch (error) {
+      task = Promise.reject(error);
+    }
+    closingResources.set(resource, task);
+    pendingCloses.add(task);
+    task.then(
+      () => pendingCloses.delete(task),
+      () => pendingCloses.delete(task),
+    );
+    return task;
+  };
   let lastSettingsKey = "";
   let lastDirectSettings = null;
   let syncGeneration = 0;
@@ -295,11 +319,11 @@ export function applyManagerAgent(
       return;
     lastDirectSettings = { ...settings };
     const generation = ++directGeneration;
-    const previousServer = directServer;
-    directServer = null;
     const replace = async () => {
+      const previousServer = directServer;
+      directServer = null;
       try {
-        await previousServer?.close();
+        await closeResource(previousServer);
       } catch {}
       if (disposed || generation !== directGeneration || !settings.enabled)
         return;
@@ -326,7 +350,7 @@ export function applyManagerAgent(
         await nextServer.start();
         if (disposed || generation !== directGeneration) {
           if (directServer === nextServer) directServer = null;
-          await nextServer.close();
+          await closeResource(nextServer);
         }
       } catch (error) {
         if (directServer === nextServer) directServer = null;
@@ -337,10 +361,13 @@ export function applyManagerAgent(
           );
           config.onError?.(error);
         }
-        await nextServer?.close();
+        await closeResource(nextServer);
       }
     };
-    void replace();
+    // Serialize every generation, including a listener already closing/starting.
+    // A newer Settings update must not bind before an older port is released.
+    directTask = directTask.catch(() => {}).then(replace);
+    void directTask.catch(() => {});
   };
 
   const syncTunnel = () => {
@@ -389,7 +416,9 @@ export function applyManagerAgent(
     const previousTunnel = tunnel;
     if (!settingsSnapshot.enabled || !settingsSnapshot.serverUrl) {
       tunnel = null;
-      previousTunnel?.close();
+      void closeResource(previousTunnel).catch((error) =>
+        console.error("[dsh-manager-plugin] tunnel close failed:", error),
+      );
       console.info(
         "[dsh-manager-plugin] Manager tunnel disabled; direct access is configured independently",
       );
@@ -442,7 +471,9 @@ export function applyManagerAgent(
     tunnel = localTunnel;
     // Replace the old transport only after the new generation is visible, so
     // late close/enrollment callbacks cannot mutate the active generation.
-    previousTunnel?.close();
+    void closeResource(previousTunnel).catch((error) =>
+      console.error("[dsh-manager-plugin] tunnel close failed:", error),
+    );
     localTunnel.start().catch((error) => {
       if (
         disposed ||
@@ -456,14 +487,15 @@ export function applyManagerAgent(
     });
   };
   const scheduleSync = () => {
-    if (syncScheduled) return;
+    if (disposed || syncScheduled) return;
     syncScheduled = true;
     // Start listeners after dsh has finished booting its web server.
-    const timer = setTimeout(() => {
+    syncTimer = setTimeout(() => {
+      syncTimer = null;
       syncScheduled = false;
       if (!disposed) syncTunnel();
     }, 0);
-    timer.unref?.();
+    syncTimer.unref?.();
   };
 
   listenForSettingsUpdates(ctx, (currentUserConfig, currentSecretConfig) => {
@@ -472,22 +504,46 @@ export function applyManagerAgent(
     scheduleSync();
   });
   scheduleSync();
-  return async () => {
+  return () => {
+    if (cleanupPromise) return cleanupPromise;
     disposed = true;
     syncGeneration++;
     directGeneration++;
-    tunnel?.close();
+    clearTimeout(syncTimer);
+    syncTimer = null;
+    syncScheduled = false;
+    const transportClose = closeResource(tunnel);
     tunnel = null;
-    const server = directServer;
+    const serverClose = closeResource(directServer);
     directServer = null;
-    await server?.close();
+    // Join old replacements as well as current resources. In particular, a
+    // listener hidden by a replacement must finish closing before unload ends.
+    cleanupPromise = (async () => {
+      const results = await Promise.allSettled([
+        directTask,
+        transportClose,
+        serverClose,
+        ...pendingCloses,
+      ]);
+      const errors = results
+        .filter((result) => result.status === "rejected")
+        .map((result) => result.reason);
+      if (errors.length) throw new AggregateError([...new Set(errors)]);
+    })();
+    return cleanupPromise;
   };
 }
 
 export const inject = ["webServer", "connection"];
 
 export function apply(ctx, config = {}) {
-  return applyManagerAgent(ctx, config);
+  // DSH entrypoint wrappers may ignore apply's return value. Explicitly own
+  // the async cleanup with the actual Cordis effect API instead of relying on
+  // a returned function ("dispose" is not a Cordis lifecycle event).
+  ctx.effect(
+    () => applyManagerAgent(ctx, config),
+    "dsh-manager-plugin resources",
+  );
 }
 
 export { ManagerTunnel } from "./tunnel.js";

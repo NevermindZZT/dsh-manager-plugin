@@ -1338,9 +1338,10 @@ export class ManagerTunnel {
     }
   }
   close() {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
+    const sockets = [...this.sockets.values(), this.socket].filter(Boolean);
     this.failOutbound(tunnelClosedError());
-    for (const socket of this.sockets.values()) socket.close();
     this.sockets.clear();
     for (const record of this.activeHttpRequests.values()) {
       record.cancelled = true;
@@ -1354,21 +1355,24 @@ export class ManagerTunnel {
     const rejectConnect = this.pendingConnectReject;
     this.pendingConnectReject = null;
     rejectConnect?.(tunnelClosedError());
-    const socket = this.socket;
     this.socket = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.keepaliveTimer = null;
-    if (socket) {
-      if (socket.readyState === WebSocket.CONNECTING) {
-        // ws.terminate() can emit a late error for a CONNECTING socket. The
-        // pending promise is already settled with an intentional-close code.
-        socket.on("error", () => {});
-        socket.terminate();
-      } else if (socket.readyState === WebSocket.OPEN) {
-        socket.close();
-      }
-    }
+    this.closePromise = Promise.all(
+      sockets.map(
+        (socket) =>
+          new Promise((resolve) => {
+            if (socket.readyState === WebSocket.CLOSED) return resolve();
+            socket.once("close", resolve);
+            // Unloading must not leave ws's graceful-close timer/socket alive.
+            // A CONNECTING socket may emit an intentional late error.
+            socket.on("error", () => {});
+            socket.terminate();
+          }),
+      ),
+    ).then(() => {});
+    return this.closePromise;
   }
 }
