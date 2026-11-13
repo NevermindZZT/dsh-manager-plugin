@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import http from "node:http";
 import { test } from "node:test";
 import { gzipSync, gunzipSync } from "node:zlib";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { shouldAllowEnrollment, validateManagerUrl } from "../src/protocol.js";
 import { ManagerTunnel } from "../src/tunnel.js";
 
@@ -369,6 +369,60 @@ test("outbound scheduler is fair, prioritized, and bounded", async () => {
     await assert.rejects(queued, { code: "MANAGER_TUNNEL_CLOSED" });
   } finally {
     tunnel.close();
+  }
+});
+
+test("outbound queue overload closes the affected WebSocket for recovery", async () => {
+  const server = http.createServer();
+  const websocketServer = new WebSocketServer({ server });
+  const port = await listen(server);
+  const localSocketPromise = new Promise((resolve) =>
+    websocketServer.once("connection", resolve),
+  );
+  const tunnel = new ManagerTunnel({
+    serverUrl: "http://manager.example:10090",
+    localOrigin: "http://127.0.0.1:" + port,
+    maxQueuedOutboundBytes: 1,
+  });
+  const managerEvents = new EventEmitter();
+  const managerSocket = {
+    readyState: WebSocket.OPEN,
+    send(payload) {
+      managerEvents.emit("message", Buffer.from(payload));
+    },
+    on: managerEvents.on.bind(managerEvents),
+    once: managerEvents.once.bind(managerEvents),
+    terminate: () => managerEvents.emit("close"),
+  };
+  tunnel.socket = managerSocket;
+  const receiveManagerMessage = messageQueue(managerSocket);
+
+  try {
+    tunnel.openWebSocket({
+      requestId: "ws-overflow",
+      path: "/api/remote.mux",
+      binaryFrames: true,
+    });
+    const opened = await receiveManagerMessage(
+      (value) => value.type === "proxy_ws_open_result",
+    );
+    assert.equal(opened.ok, true);
+
+    const localSocket = await localSocketPromise;
+    const localClose = new Promise((resolve) =>
+      localSocket.once("close", (code) => resolve(code)),
+    );
+    localSocket.send("assistant-stream-frame");
+    const closed = await receiveManagerMessage(
+      (value) => value.type === "proxy_ws_close",
+    );
+    assert.match(closed.error, /outbound WebSocket queue overflow/);
+    assert.equal(await localClose, 1013);
+    assert.equal(tunnel.proxyMetrics.outboundRejected, 1);
+  } finally {
+    await tunnel.close();
+    await closeWebSocketServer(websocketServer);
+    await closeServer(server);
   }
 });
 

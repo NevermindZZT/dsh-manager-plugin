@@ -19,8 +19,8 @@ const defaultMaxBufferedResponseBytes = 32 * 1024 * 1024;
 const defaultMaxStreamRequestBytes = 64 * 1024 * 1024;
 const defaultMaxStreamRequestChunkBytes = 64 * 1024;
 const defaultMaxBufferedStreamRequestBytes = 32 * 1024 * 1024;
-const defaultMaxQueuedOutboundFrames = 256;
-const defaultMaxQueuedOutboundBytes = 8 * 1024 * 1024;
+const defaultMaxQueuedOutboundFrames = 512;
+const defaultMaxQueuedOutboundBytes = 64 * 1024 * 1024;
 const outboundPriorities = ["critical", "interactive", "bulk"];
 // Weighted round-robin gives control frames low latency without starving
 // response chunks when a manager is busy.
@@ -622,18 +622,33 @@ export class ManagerTunnel {
       body === undefined ? JSON.stringify(value) : binaryEnvelope(value, body);
     return this.enqueueOutbound(payload, priority);
   }
-  sendBinary(value, body, priority = outboundPriority(value)) {
-    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+  sendBinary(value, body, priority = outboundPriority(value), onRejected) {
+    const reject = (error) => {
+      if (typeof onRejected === "function") {
+        try {
+          onRejected(error);
+        } catch (callbackError) {
+          console.error(
+            "[dsh-manager-plugin] outbound rejection handler failed:",
+            callbackError?.message || callbackError,
+          );
+        }
+        return;
+      }
+      console.warn(
+        "[dsh-manager-plugin] outbound binary frame rejected:",
+        error.message,
+      );
+    };
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      reject(tunnelClosedError());
+      return false;
+    }
     const payload = binaryEnvelope(
       { ...value, type: value.type || "proxy_response_binary" },
       body,
     );
-    this.enqueueOutbound(payload, priority).catch((error) =>
-      console.warn(
-        "[dsh-manager-plugin] outbound frame dropped:",
-        error.message,
-      ),
-    );
+    this.enqueueOutbound(payload, priority).catch(reject);
     return true;
   }
   async handleMessage(raw, isBinary = false) {
@@ -885,7 +900,24 @@ export class ManagerTunnel {
       setCookies,
     };
     if (message.binaryResponse === true)
-      this.sendBinary({ ...metadata, type: "proxy_response_binary" }, bytes);
+      this.sendBinary(
+        { ...metadata, type: "proxy_response_binary" },
+        bytes,
+        undefined,
+        (error) => {
+          console.warn(
+            "[dsh-manager-plugin] binary HTTP response could not be relayed:",
+            message.requestId,
+            error.message,
+          );
+          this.send({
+            type: "proxy_response",
+            requestId: message.requestId,
+            status: 502,
+            error: "manager outbound response queue is full",
+          });
+        },
+      );
     else this.send({ ...metadata, body: bytes.toString("base64") });
   }
   failHttpProxy(message, record, error) {
@@ -1214,7 +1246,24 @@ export class ManagerTunnel {
         setCookies,
       };
       if (message.binaryResponse === true) {
-        this.sendBinary({ ...metadata, type: "proxy_response_binary" }, bytes);
+        this.sendBinary(
+          { ...metadata, type: "proxy_response_binary" },
+          bytes,
+          undefined,
+          (error) => {
+            console.warn(
+              "[dsh-manager-plugin] binary HTTP response could not be relayed:",
+              message.requestId,
+              error.message,
+            );
+            this.send({
+              type: "proxy_response",
+              requestId: message.requestId,
+              status: 502,
+              error: "manager outbound response queue is full",
+            });
+          },
+        );
       } else {
         this.send({
           ...metadata,
@@ -1273,6 +1322,29 @@ export class ManagerTunnel {
         },
       });
       this.sockets.set(message.requestId, socket);
+      let relayFailed = false;
+      const failRelay = (error) => {
+        if (relayFailed) return;
+        relayFailed = true;
+        const reason =
+          "manager outbound WebSocket queue overflow: " +
+          (error?.message || String(error));
+        console.warn(
+          "[dsh-manager-plugin] aborting WebSocket relay to preserve stream ordering:",
+          message.requestId,
+          error?.message || error,
+        );
+        this.send({
+          type: "proxy_ws_close",
+          requestId: message.requestId,
+          error: reason,
+        });
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.close(1013, "manager relay backpressure; reconnect");
+        } else if (socket.readyState === WebSocket.CONNECTING) {
+          socket.terminate();
+        }
+      };
       socket.on("open", () =>
         this.send({
           type: "proxy_ws_open_result",
@@ -1290,6 +1362,8 @@ export class ManagerTunnel {
               frameType: isBinary ? "binary" : "text",
             },
             body,
+            undefined,
+            failRelay,
           );
         else
           this.send({
@@ -1299,20 +1373,16 @@ export class ManagerTunnel {
             body: body.toString("base64"),
           });
       });
-      socket.on("error", (error) =>
-        this.send({
-          type: "proxy_ws_close",
-          requestId: message.requestId,
-          error: error.message,
-        }),
-      );
+      socket.on("error", failRelay);
       socket.on("close", () => {
         this.sockets.delete(message.requestId);
-        this.send({
-          type: "proxy_ws_close",
-          requestId: message.requestId,
-          error: "local dsh websocket closed",
-        });
+        if (!relayFailed) {
+          this.send({
+            type: "proxy_ws_close",
+            requestId: message.requestId,
+            error: "local dsh websocket closed",
+          });
+        }
       });
     } catch (error) {
       this.send({
