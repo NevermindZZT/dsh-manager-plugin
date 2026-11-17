@@ -449,7 +449,7 @@ export function applyManagerAgent(
       },
       name: settingsSnapshot.name,
       instanceId: settingsSnapshot.instanceId,
-      pluginVersion: config.pluginVersion || "0.4.3",
+      pluginVersion: config.pluginVersion || "0.4.4",
       localOrigin: "http://127.0.0.1:" + ctx.webServer.port,
       startupUrl: ctx.connection.authenticatedUrl(
         "http://127.0.0.1:" + ctx.webServer.port,

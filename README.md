@@ -1,10 +1,15 @@
 # @nevermindzzt/dsh-manager-plugin
 
-![Version](https://img.shields.io/badge/version-v0.4.3-blue)
+![Version](https://img.shields.io/badge/version-v0.4.4-blue)
 ![Protocol](https://img.shields.io/badge/dsh--manager%20Protocol-v1-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-本版本适配 DSH `0.1.7-rc.2`：插件以命名导出 `name`、`Config`、`inject`、`apply`，使 DSH loader 的 module namespace 保留 Config schema；client 端通过 `configForms.get/whileServed` 和 `plugins.bundle.config` slot 渲染 RC2 设置卡片。未被 DSH user layer 覆盖的 Manager URL、Agent 名称和实例 ID 会显示当前 environment/local-state 有效值；显式 DSH user overrides 优先。字段使用 volatile schema，`pairingCode` 使用 `secret` role 并以 write-only 控件保存。Host-side `describe({ redactSecrets: true })` 只把非敏感 user overrides 交给隧道配置解析；配对码仅从 volatile Config/受保护的本地状态读取，不放入 descriptor user data。settings 更新按 `settings/document-updated(ns, revision)` 处理并忽略重复或过期 revision；不再使用旧 `settingsScope` / `settings.plugin.item` API。DSH 插件列表显示名称来自 `locale/<lang>.json` 的 `meta.title`，图标来自 `package.json` 的相对 `icon` 文件；`dsh.patch.yml` 中的 `name` 仍保留为实际模块 specifier。
+本版本最低适配 DSH `0.2.2-rc.3`：插件以命名导出 `name`、`Config`、`inject`、`apply`，使 DSH loader 的 module namespace 保留 Config schema；client 端通过 `configForms.get/whileServed` 和 `plugins.bundle.config` slot 渲染 RC2 设置卡片。Manager bundle 同时将工作区目录选择器固定为 Host browse 后端与配套 Client 浏览界面，避免回环代理把远程请求误判为本机原生文件选择器。未被 DSH user layer 覆盖的 Manager URL、Agent 名称和实例 ID 会显示当前 environment/local-state 有效值；显式 DSH user overrides 优先。字段使用 volatile schema，`pairingCode` 使用 `secret` role 并以 write-only 控件保存。Host-side `describe({ redactSecrets: true })` 只把非敏感 user overrides 交给隧道配置解析；配对码仅从 volatile Config/受保护的本地状态读取，不放入 descriptor user data。settings 更新按 `settings/document-updated(ns, revision)` 处理并忽略重复或过期 revision；不再使用旧 `settingsScope` / `settings.plugin.item` API。DSH 插件列表显示名称来自 `locale/<lang>.json` 的 `meta.title`，图标来自 `package.json` 的相对 `icon` 文件；`dsh.patch.yml` 中的 `name` 仍保留为实际模块 specifier。
+
+## 0.4.4 Remote workspace directory picker
+
+- Use the host-backed in-app directory browser for Manager-proxied workspace selection instead of a host-native dialog invisible to remote browsers.
+- Require DSH `0.2.2-rc.3` or later for the shipped browse backend and Client flow.
 
 ## 0.3.0 DSH RC2 settings and package branding
 
@@ -52,7 +57,7 @@
 ## 安装
 
 ```powershell
-dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.4.3
+dsh plugin --profile web add @nevermindzzt/dsh-manager-plugin@0.4.4
 ```
 
 安装后重启 dsh：

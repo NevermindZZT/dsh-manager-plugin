@@ -27,6 +27,12 @@ const packageRoot = path.resolve(
 const pkg = JSON.parse(
   fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
 );
+const dshPluginManifest = JSON.parse(
+  fs.readFileSync(path.join(packageRoot, "dsh.plugin.json"), "utf8"),
+);
+const packageLock = JSON.parse(
+  fs.readFileSync(path.join(packageRoot, "package-lock.json"), "utf8"),
+);
 const manifest = fs.readFileSync(
   path.join(packageRoot, "dsh.patch.yml"),
   "utf8",
@@ -41,12 +47,18 @@ function serializedMeta(schema) {
   return json.refs[String(schema.uid)]?.meta || {};
 }
 
-test("DSH 0.1.7-rc.2 discovers named plugin Config and defaults", () => {
+test("DSH 0.2.2-rc.3 discovers named plugin Config and defaults", () => {
   assert.equal(Config, DSH_MANAGER_SETTINGS_SCHEMA);
   assert.equal(name, "dsh-manager-plugin");
   assert.equal(typeof apply, "function");
   assert.deepEqual(inject, ["webServer", "connection"]);
   assert.equal(DSH_MANAGER_SETTINGS_ENTRY_ID, "dsh-manager-plugin");
+  assert.equal(pkg.version, "0.4.4");
+  assert.equal(dshPluginManifest.version, pkg.version);
+  assert.equal(packageLock.version, pkg.version);
+  assert.equal(packageLock.packages[""].version, pkg.version);
+  assert.deepEqual(packageLock.packages[""].engines, pkg.engines);
+  assert.equal(pkg.engines.dsh, ">=0.2.2-rc.3");
   assert.match(manifest, /id: dsh-manager-plugin/);
   const defaults = Object.fromEntries(
     Object.entries(DSH_MANAGER_SETTINGS_SCHEMA({}))
@@ -66,6 +78,21 @@ test("DSH 0.1.7-rc.2 discovers named plugin Config and defaults", () => {
     directAccessHost: "127.0.0.1",
     directAccessPort: 3081,
   });
+});
+
+test("Manager bundle disables auto picker and pairs the Host browse backend with its Client flow", () => {
+  assert.match(
+    manifest,
+    /- id: directory-picker\s+name: '@deepseek-ai\/dsh-host-directory-picker-auto'\s+disabled: true/,
+  );
+  assert.match(
+    manifest,
+    /id: dsh-manager-directory-picker-browse-host\s+name: '@deepseek-ai\/dsh-host-directory-picker-browse'/,
+  );
+  assert.match(
+    manifest,
+    /id: dsh-manager-directory-picker-browse-client\s+name: '@deepseek-ai\/dsh-client-ui-directory-picker-browse'/,
+  );
 });
 
 test("every editable field serializes volatile metadata and pairing code is secret", () => {
